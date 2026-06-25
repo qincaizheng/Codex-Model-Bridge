@@ -309,25 +309,52 @@ ensure_local_redirector_enabled() {
     exit 1
 }
 
+find_existing_capture_pids() {
+    ps axww -o pid=,command= | awk -v script="$REWRITE_SCRIPT" -v current="$$" '
+        $1 != current && /mitmdump/ && index($0, script) && $0 !~ /awk -v script/ {
+            print $1
+        }
+    '
+}
+
+stop_existing_capture() {
+    local pids pid still_running failed
+    pids="$(find_existing_capture_pids)"
+    [ -n "$pids" ] || return 0
+
+    info "      stopping previous mitmdump capture: $(echo "$pids" | tr '\n' ' ')"
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done <<< "$pids"
+
+    sleep 1
+    still_running=""
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            still_running="${still_running}${pid} "
+        fi
+    done <<< "$pids"
+
+    [ -n "$still_running" ] || return 0
+    sleep 1
+    failed=""
+    for pid in $still_running; do
+        if kill -0 "$pid" 2>/dev/null; then
+            failed="${failed}${pid} "
+        fi
+    done
+    [ -z "$failed" ] || die "could not stop previous mitmdump capture: $failed"
+}
+
 start_proxy_and_open_codex() {
     info "[5/5] starting capture"
     info "      local spec: $MITM_LOCAL_SPEC"
     info "      config: $CONFIG_FILE"
 
-    local existing_capture
-    existing_capture="$(
-        ps axww -o pid=,command= | awk -v script="$REWRITE_SCRIPT" '
-            /mitmdump/ && index($0, script) {
-                print
-            }
-        '
-    )"
-    if [ -n "$existing_capture" ]; then
-        echo "Error: another mitmdump Codex capture is already running." >&2
-        echo "$existing_capture" | sed 's/^/      /' >&2
-        exit 1
-    fi
-
+    stop_existing_capture
     export MITM_REWRITE_CONFIG="$CONFIG_FILE"
 
     local mitmdump_args=(mitmdump)

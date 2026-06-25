@@ -714,20 +714,33 @@ function Ensure-LocalRedirectorReady {
     exit 1
 }
 
-function Ensure-NoExistingCapture {
+function Stop-ExistingCapture {
     $existing = Get-CimInstance Win32_Process |
         Where-Object {
             $_.CommandLine -and
             $_.CommandLine.Contains("mitmdump") -and
-            $_.CommandLine.Contains($RewriteScript)
+            $_.CommandLine.Contains($RewriteScript) -and
+            $_.ProcessId -ne $PID
         }
 
     if ($existing) {
-        Write-Error "another mitmdump Codex capture is already running."
+        Info "      stopping previous mitmdump capture"
         $existing | ForEach-Object {
-            Write-Host ("      {0} {1}" -f $_.ProcessId, $_.CommandLine)
+            Info ("      {0}" -f $_.ProcessId)
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
-        exit 1
+        Start-Sleep -Seconds 1
+
+        $failed = @()
+        $existing | ForEach-Object {
+            $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+            if ($process) {
+                $failed += $_.ProcessId
+            }
+        }
+        if ($failed.Count -gt 0) {
+            Die ("could not stop previous mitmdump capture: {0}" -f ($failed -join ", "))
+        }
     }
 }
 
@@ -736,7 +749,7 @@ function Start-CaptureAndOpenCodex {
     Info "      local spec: $MitmLocalSpec"
     Info "      config: $ConfigFile"
 
-    Ensure-NoExistingCapture
+    Stop-ExistingCapture
     [Environment]::SetEnvironmentVariable("MITM_REWRITE_CONFIG", $ConfigFile, "Process")
 
     $mitm = Start-Process -FilePath $script:MitmDumpCmd `

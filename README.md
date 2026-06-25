@@ -91,8 +91,9 @@ On startup the launcher:
 2. Refuses to continue if Codex is already running.
 3. Installs `mitmdump` if missing.
 4. Creates and trusts the mitmproxy CA if needed.
-5. Starts mitmproxy local capture for Codex process names.
-6. Launches Codex with system proxy variables cleared and Chromium proxy
+5. Stops any previous mitmdump capture using the same `rewrite.py`.
+6. Starts mitmproxy local capture for Codex process names.
+7. Launches Codex with system proxy variables cleared and Chromium proxy
    bypass flags enabled.
 
 When `upstream_proxy` is set, Codex is still launched without the system proxy,

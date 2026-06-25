@@ -80,6 +80,9 @@ Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 启动前开启本地捕获。Codex 会以绕过系统代理的方式启动，避免直接连到系统代理
 端口导致 mitmproxy local mode 捕获不到。
 
+启动新的捕获前，脚本会自动停止使用同一个 `rewrite.py` 的旧 mitmdump 捕获进程。
+这只清理旧 mitmdump，不会自动杀掉 Codex 本体。
+
 如果 `ab.chatgpt.com/v1/initialize` 已经进入 mitmproxy，但网络或上游代理不可用，
 或者超过 `ab_fallback_timeout_seconds` 仍未完成，插件会本地构造 Statsig
 initialize 返回值，继续注入配置模型并设置默认模型。
