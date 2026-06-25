@@ -96,6 +96,11 @@ but mitmdump forwards captured outbound traffic through that proxy.
 - Windows Store installs are launched through the app execution alias or AUMID
   when direct `WindowsApps` execution is blocked.
 
+## Recommended Companion
+
+This project is recommended to use together with
+[ZhiYi-R/moon-bridge](https://github.com/ZhiYi-R/moon-bridge).
+
 ## Logs
 
 Normal useful lines look like:
