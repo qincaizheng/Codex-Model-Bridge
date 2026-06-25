@@ -69,9 +69,10 @@ def _resolve_config_path(value: str) -> str:
 
 
 def _default_catalog_candidates() -> tuple[str, ...]:
+    home = os.path.expanduser("~")
     return (
         os.path.join(os.path.dirname(_config_path()), "models_catalog.json"),
-        os.path.expanduser("~/.codex/models_catalog.json"),
+        os.path.join(home, ".codex", "models_catalog.json"),
     )
 
 
