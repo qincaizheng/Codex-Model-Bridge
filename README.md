@@ -31,7 +31,7 @@ The launchers accept no command-line arguments. Edit `config.json` instead.
 {
   "codex_app_path": "",
   "model_source": "catalog_json",
-  "catalog_json": "models_catalog.json",
+  "catalog_json": "",
   "api_base_url": "",
   "api_key": "",
   "upstream_proxy": "",
@@ -39,16 +39,17 @@ The launchers accept no command-line arguments. Edit `config.json` instead.
 }
 ```
 
-Relative paths, such as `models_catalog.json`, are resolved relative to
-`config.json`, not the shell's current directory.
+Relative paths are resolved relative to `config.json`, not the shell's current
+directory.
 
 Fields:
 
 - `codex_app_path`: leave empty to auto-detect Codex. Set it only when the
   launcher cannot find the app.
 - `model_source`: `catalog_json`, `api`, or `both`.
-- `catalog_json`: local model catalog path. Put `models_catalog.json` next to
-  `config.json`, or point this at another JSON file.
+- `catalog_json`: local model catalog path. Leave empty to auto-detect
+  `models_catalog.json` next to `config.json`, then
+  `~/.codex/models_catalog.json`; or set an explicit JSON file.
 - `api_base_url`: OpenAI-compatible base URL. The addon fetches
   `${api_base_url}/models` when `model_source` is `api` or `both`.
 - `api_key`: optional bearer token for `api_base_url`.
@@ -70,6 +71,10 @@ The traffic path is:
 ```text
 Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 ```
+
+If the startup request to `ab.chatgpt.com/v1/initialize` fails because the
+network or upstream proxy is unavailable, the addon builds a local fallback
+Statsig initialize response with the configured models and desired default.
 
 On startup the launcher:
 
@@ -98,6 +103,7 @@ Normal useful lines look like:
 ```text
 [codex-patch] AB request patched: ...
 [codex-patch] AB response patched: ...
+[codex-patch] AB fallback response built: ...
 [codex-patch] Models response patched: ...
 ```
 

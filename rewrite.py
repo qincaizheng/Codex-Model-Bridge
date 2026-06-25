@@ -16,13 +16,14 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from copy import deepcopy
 from typing import Any
 
-from mitmproxy import ctx
+from mitmproxy import ctx, http
 
 
 STATSIG_HOST = "ab.chatgpt.com"
@@ -34,6 +35,11 @@ DEFAULT_MODEL_SOURCE = "catalog_json"
 DEFAULT_UPSTREAM_PROXY = ""
 
 STALE_HEADERS = ("content-length", "etag", "last-modified", "content-md5")
+FALLBACK_RESPONSE_HEADERS = {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+}
 REQUEST_DELTA_KEYS = (
     "sinceTime",
     "previousDerivedFields",
@@ -52,7 +58,7 @@ def _script_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-DEFAULT_CATALOG_JSON = os.path.join(_script_dir(), "models_catalog.json")
+DEFAULT_CATALOG_JSON = ""
 
 
 def _resolve_config_path(value: str) -> str:
@@ -60,6 +66,21 @@ def _resolve_config_path(value: str) -> str:
     if os.path.isabs(expanded):
         return expanded
     return os.path.join(os.path.dirname(_config_path()), expanded)
+
+
+def _default_catalog_candidates() -> tuple[str, ...]:
+    return (
+        os.path.join(os.path.dirname(_config_path()), "models_catalog.json"),
+        os.path.expanduser("~/.codex/models_catalog.json"),
+    )
+
+
+def _find_default_catalog_path() -> str:
+    candidates = _default_catalog_candidates()
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
 
 
 def _log(level: str, message: str) -> None:
@@ -204,7 +225,7 @@ def _compact_value(value: Any) -> str:
 class CodexCatalogPatcher:
     def __init__(self) -> None:
         self.model_source = DEFAULT_MODEL_SOURCE
-        self.catalog_path = DEFAULT_CATALOG_JSON
+        self.catalog_path = _find_default_catalog_path()
         self.api_base_url = ""
         self.api_key = ""
         self.desired_model = DEFAULT_DESIRED_MODEL
@@ -282,6 +303,26 @@ class CodexCatalogPatcher:
         if _is_models_response_candidate(request):
             self._patch_models_response(request, response)
 
+    def error(self, flow) -> None:
+        request = getattr(flow, "request", None)
+        if request is None or not _is_statsig_initialize(request):
+            return
+        if getattr(flow, "response", None) is not None:
+            return
+
+        body = self._build_statsig_fallback_body()
+        flow.response = http.Response.make(
+            200,
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            FALLBACK_RESPONSE_HEADERS,
+        )
+        flow.error = None
+        _log(
+            "error",
+            f"[codex-patch] AB fallback response built: host={getattr(request, 'pretty_host', request.host)} "
+            f"path={_request_path(request)} {self._statsig_body_summary(body)}",
+        )
+
     def _load_config(self) -> None:
         path = _config_path()
         try:
@@ -303,8 +344,10 @@ class CodexCatalogPatcher:
 
         if isinstance(model_source, str) and model_source:
             self.model_source = model_source
-        if isinstance(catalog_path, str) and catalog_path:
+        if isinstance(catalog_path, str) and catalog_path.strip():
             self.catalog_path = _resolve_config_path(catalog_path)
+        else:
+            self.catalog_path = _find_default_catalog_path()
         if isinstance(api_base_url, str):
             self.api_base_url = api_base_url
         if isinstance(api_key, str):
@@ -345,15 +388,25 @@ class CodexCatalogPatcher:
             models.extend(self._load_catalog_models())
 
         clean_models, slugs = self._dedupe_models(models)
+        if self.desired_model not in slugs:
+            clean_models.append(
+                {
+                    "slug": self.desired_model,
+                    "id": self.desired_model,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "openai",
+                }
+            )
+            slugs.append(self.desired_model)
+            _log(
+                "warn",
+                f"[codex-patch] desired_model={self.desired_model} is not in "
+                "loaded models; using a minimal model row",
+            )
         self.catalog_models = clean_models
         self.catalog_slugs = slugs
 
-        if self.desired_model not in self.catalog_slugs:
-            _log(
-                "error",
-                f"[codex-patch] desired_model={self.desired_model} is not in "
-                "loaded models",
-            )
         _log(
             "info",
             f"[codex-patch] Loaded {len(self.catalog_slugs)} model(s) from "
@@ -364,6 +417,9 @@ class CodexCatalogPatcher:
         try:
             with open(self.catalog_path, encoding="utf-8") as f:
                 catalog = json.load(f)
+        except FileNotFoundError:
+            _log("warn", f"[codex-patch] Catalog not found: {self.catalog_path}")
+            return []
         except (OSError, json.JSONDecodeError) as exc:
             _log("error", f"[codex-patch] Failed to load catalog {self.catalog_path}: {exc}")
             return []
@@ -597,6 +653,44 @@ class CodexCatalogPatcher:
         if missing:
             parts.append("missing=" + ",".join(missing))
         return " ".join(parts)
+
+    def _build_statsig_fallback_body(self) -> dict[str, Any]:
+        dynamic_configs: dict[str, Any] = {}
+        for key in STATSIG_DYNAMIC_CONFIG_KEYS:
+            dynamic_configs[key] = {
+                "name": key,
+                "value": self._merged_statsig_value({}),
+                "rule_id": "codex_model_bridge_fallback",
+                "group": "codex_model_bridge_fallback",
+                "id_type": "userID",
+                "secondary_exposures": [],
+                "explicit_parameters": [],
+                "is_device_based": False,
+                "is_experiment_active": True,
+                "is_user_in_experiment": True,
+            }
+
+        return {
+            "feature_gates": {},
+            "dynamic_configs": dynamic_configs,
+            "layer_configs": {},
+            "sdkParams": {},
+            "has_updates": True,
+            "generator": "codex-model-bridge",
+            "time": int(time.time() * 1000),
+            "company_lcut": 0,
+            "evaluated_keys": {},
+            "hash_used": "none",
+            "derived_fields": {},
+            "hashed_sdk_key_used": None,
+            "can_record_session": False,
+            "recording_blocked": True,
+            "session_recording_rate": 0,
+            "param_stores": {},
+            "sdk_flags": {},
+            "target_app_used": "codex-model-bridge",
+            "full_checksum": "codex-model-bridge-fallback",
+        }
 
     def _statsig_entry_summary(self, body: dict[str, Any], entry: Any) -> dict[str, Any]:
         if not isinstance(entry, dict):

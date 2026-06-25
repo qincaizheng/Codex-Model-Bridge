@@ -1,7 +1,7 @@
 {
   "codex_app_path": "",
   "model_source": "catalog_json",
-  "catalog_json": "~/.codex/models_catalog.json",
+  "catalog_json": "",
   "api_base_url": "",
   "api_key": "",
   "upstream_proxy": "",
