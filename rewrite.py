@@ -33,6 +33,7 @@ STATSIG_DYNAMIC_CONFIG_KEYS = ("107580212", "2523198654")
 DEFAULT_DESIRED_MODEL = "gpt-5.5"
 DEFAULT_MODEL_SOURCE = "catalog_json"
 DEFAULT_UPSTREAM_PROXY = ""
+DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS = 8
 
 STALE_HEADERS = ("content-length", "etag", "last-modified", "content-md5")
 FALLBACK_RESPONSE_HEADERS = {
@@ -215,6 +216,19 @@ def _parse_upstream_proxy(value: str) -> tuple[str, tuple[str, int]] | None:
     return parsed.scheme, (parsed.hostname, port)
 
 
+def _parse_timeout_seconds(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str) and value.strip():
+        try:
+            return max(0, int(float(value.strip())))
+        except ValueError:
+            return default
+    return default
+
+
 def _compact_value(value: Any) -> str:
     if isinstance(value, bool):
         return str(value).lower()
@@ -231,12 +245,14 @@ class CodexCatalogPatcher:
         self.api_key = ""
         self.desired_model = DEFAULT_DESIRED_MODEL
         self.upstream_proxy = DEFAULT_UPSTREAM_PROXY
+        self.ab_fallback_timeout_seconds = DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS
         self.upstream_via: tuple[str, tuple[str, int]] | None = None
         self.catalog_models: list[dict[str, Any]] = []
         self.catalog_slugs: list[str] = []
 
     def load(self, loader) -> None:
         self._load_config()
+        self._apply_timeout_option()
         self._load_model_sources()
 
     def _apply_upstream_proxy(self, server) -> None:
@@ -311,18 +327,7 @@ class CodexCatalogPatcher:
         if getattr(flow, "response", None) is not None:
             return
 
-        body = self._build_statsig_fallback_body()
-        flow.response = http.Response.make(
-            200,
-            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
-            FALLBACK_RESPONSE_HEADERS,
-        )
-        flow.error = None
-        _log(
-            "error",
-            f"[codex-patch] AB fallback response built: host={getattr(request, 'pretty_host', request.host)} "
-            f"path={_request_path(request)} {self._statsig_body_summary(body)}",
-        )
+        self._set_statsig_fallback_response(flow, reason="flow_error")
 
     def _load_config(self) -> None:
         path = _config_path()
@@ -342,6 +347,10 @@ class CodexCatalogPatcher:
         api_base_url = config.get("api_base_url", "")
         api_key = config.get("api_key", "")
         upstream_proxy = config.get("upstream_proxy", DEFAULT_UPSTREAM_PROXY)
+        ab_fallback_timeout_seconds = config.get(
+            "ab_fallback_timeout_seconds",
+            DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS,
+        )
 
         if isinstance(model_source, str) and model_source:
             self.model_source = model_source
@@ -355,6 +364,10 @@ class CodexCatalogPatcher:
             self.api_key = api_key
         if isinstance(desired_model, str) and desired_model:
             self.desired_model = desired_model
+        self.ab_fallback_timeout_seconds = _parse_timeout_seconds(
+            ab_fallback_timeout_seconds,
+            DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS,
+        )
         if isinstance(upstream_proxy, str):
             self.upstream_proxy = upstream_proxy.strip()
             try:
@@ -369,8 +382,17 @@ class CodexCatalogPatcher:
             f"catalog_json={self.catalog_path}, "
             f"api_base_url={self.api_base_url or '<unset>'}, "
             f"desired_model={self.desired_model}, "
-            f"upstream_proxy={self.upstream_proxy or '<direct>'}",
+            f"upstream_proxy={self.upstream_proxy or '<direct>'}, "
+            f"ab_fallback_timeout_seconds={self.ab_fallback_timeout_seconds}",
         )
+
+    def _apply_timeout_option(self) -> None:
+        if self.ab_fallback_timeout_seconds <= 0:
+            return
+        options = getattr(ctx, "options", None)
+        if options is None or not hasattr(options, "update"):
+            return
+        options.update(tcp_timeout=self.ab_fallback_timeout_seconds)
 
     def _load_model_sources(self) -> None:
         models: list[dict[str, Any]] = []
@@ -569,6 +591,10 @@ class CodexCatalogPatcher:
 
         body = self._read_json_response(response)
         if body is None or not isinstance(body, dict):
+            status = getattr(response, "status_code", 0)
+            if isinstance(status, int) and status >= 500:
+                self._set_statsig_fallback_response(flow, reason=f"status_{status}")
+                return
             _log(
                 "error",
                 f"[codex-patch] AB response patch failed: host={getattr(flow.request, 'pretty_host', flow.request.host)} "
@@ -692,6 +718,21 @@ class CodexCatalogPatcher:
             "target_app_used": "codex-model-bridge",
             "full_checksum": "codex-model-bridge-fallback",
         }
+
+    def _set_statsig_fallback_response(self, flow, reason: str) -> None:
+        body = self._build_statsig_fallback_body()
+        flow.response = http.Response.make(
+            200,
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            FALLBACK_RESPONSE_HEADERS,
+        )
+        flow.error = None
+        request = flow.request
+        _log(
+            "error",
+            f"[codex-patch] AB fallback response built: host={getattr(request, 'pretty_host', request.host)} "
+            f"path={_request_path(request)} reason={reason} {self._statsig_body_summary(body)}",
+        )
 
     def _statsig_entry_summary(self, body: dict[str, Any], entry: Any) -> dict[str, Any]:
         if not isinstance(entry, dict):

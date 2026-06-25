@@ -5,5 +5,6 @@
   "api_base_url": "",
   "api_key": "",
   "upstream_proxy": "",
+  "ab_fallback_timeout_seconds": 8,
   "desired_model": "gpt-5.5"
 }

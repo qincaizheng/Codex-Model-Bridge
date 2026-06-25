@@ -39,6 +39,7 @@ powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
   "api_base_url": "",
   "api_key": "",
   "upstream_proxy": "",
+  "ab_fallback_timeout_seconds": 8,
   "desired_model": "gpt-5.5"
 }
 ```
@@ -55,6 +56,9 @@ powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
 - `api_key`：`api_base_url` 的可选 bearer token。
 - `upstream_proxy`：mitmdump 出站流量使用的可选 HTTP(S) 代理。搭配
   FlClash 时可设置为 `http://127.0.0.1:7890`。
+- `ab_fallback_timeout_seconds`：AB 启动请求挂住时触发本地兜底返回的超时
+  秒数。设置为 `0` 时保留 mitmproxy 默认 TCP 超时。这个值会作为当前
+  helper 进程的 mitmproxy `tcp_timeout` 生效。
 - `desired_model`：要注入并设为默认值的模型。
 
 `host` 和 `path` 不需要配置，项目固定处理：
@@ -77,7 +81,8 @@ Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 端口导致 mitmproxy local mode 捕获不到。
 
 如果 `ab.chatgpt.com/v1/initialize` 已经进入 mitmproxy，但网络或上游代理不可用，
-插件会本地构造 Statsig initialize 返回值，继续注入配置模型并设置默认模型。
+或者超过 `ab_fallback_timeout_seconds` 仍未完成，插件会本地构造 Statsig
+initialize 返回值，继续注入配置模型并设置默认模型。
 
 当 `upstream_proxy` 有值时，Codex 本身仍然绕过系统代理，但 mitmdump 会把捕获到
 的出站流量转发给这个上游代理。

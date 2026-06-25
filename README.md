@@ -37,6 +37,7 @@ The launchers accept no command-line arguments. Edit `config.json` instead.
   "api_base_url": "",
   "api_key": "",
   "upstream_proxy": "",
+  "ab_fallback_timeout_seconds": 8,
   "desired_model": "gpt-5.5"
 }
 ```
@@ -58,6 +59,10 @@ Fields:
 - `api_key`: optional bearer token for `api_base_url`.
 - `upstream_proxy`: optional HTTP(S) proxy for mitmdump outbound traffic. For
   FlClash, set this to `http://127.0.0.1:7890`.
+- `ab_fallback_timeout_seconds`: timeout used to trigger the local AB fallback
+  response when the startup request hangs. Set `0` to keep mitmproxy's default
+  TCP timeout. This is applied as mitmproxy's `tcp_timeout` for this helper
+  process.
 - `desired_model`: model to inject and make the default.
 
 `host` and `path` are intentionally not configurable. The addon patches:
@@ -76,8 +81,9 @@ Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 ```
 
 If the startup request to `ab.chatgpt.com/v1/initialize` fails because the
-network or upstream proxy is unavailable, the addon builds a local fallback
-Statsig initialize response with the configured models and desired default.
+network or upstream proxy is unavailable, or if it exceeds
+`ab_fallback_timeout_seconds`, the addon builds a local fallback Statsig
+initialize response with the configured models and desired default.
 
 On startup the launcher:
 
