@@ -38,6 +38,8 @@ The launchers accept no command-line arguments. Edit `config.json` instead.
   "api_key": "",
   "upstream_proxy": "",
   "ab_fallback_timeout_seconds": 8,
+  "enable_i18n": true,
+  "locale_source": "FIRST_AVAILABLE",
   "desired_model": "gpt-5.5"
 }
 ```
@@ -63,6 +65,12 @@ Fields:
   response when the startup request hangs. Set `0` to keep mitmproxy's default
   TCP timeout. This is applied as mitmproxy's `tcp_timeout` for this helper
   process.
+- `enable_i18n`: enables Codex's UI localization layer in the AB initialize
+  response.
+- `locale_source`: UI locale source for that layer. Supported values are
+  `IDE`, `SYSTEM`, and `FIRST_AVAILABLE`. A specific manual language override
+  is stored by Codex as its local `localeOverride` setting, not directly in the
+  AB response.
 - `desired_model`: model to inject and make the default.
 
 `host` and `path` are intentionally not configurable. The addon patches:
@@ -80,10 +88,14 @@ The traffic path is:
 Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 ```
 
-If the startup request to `ab.chatgpt.com/v1/initialize` fails because the
-network or upstream proxy is unavailable, or if it exceeds
-`ab_fallback_timeout_seconds`, the addon builds a local fallback Statsig
-initialize response with the configured models and desired default.
+When the startup request to `ab.chatgpt.com/v1/initialize` enters the addon,
+the addon performs the upstream request itself. If that upstream request fails
+or exceeds `ab_fallback_timeout_seconds`, the addon directly returns a local
+fallback Statsig initialize response with the configured models and desired
+default. It also injects Codex's UI localization layer using `enable_i18n` and
+`locale_source`. The launchers also force mitmproxy's `connection_strategy=lazy`,
+so mitmproxy does not try to connect upstream before the addon can see the
+request.
 
 On startup the launcher:
 
@@ -113,7 +125,21 @@ This project is recommended to use together with
 
 ## Logs
 
-Normal useful lines look like:
+The foreground output is intentionally short. On macOS and Linux, Codex stderr
+and mitmproxy core logs are written to local log files, and only addon lines
+containing `[codex-patch]` are echoed to the terminal. Windows writes mitmdump
+output and direct Codex launch output under
+`%LOCALAPPDATA%\CodexModelBridge\Logs`.
+
+Log locations:
+
+```text
+macOS:   ~/Library/Logs/CodexModelBridge/
+Linux:   ${XDG_STATE_HOME:-~/.local/state}/CodexModelBridge/
+Windows: %LOCALAPPDATA%\CodexModelBridge\Logs\
+```
+
+Useful addon lines look like:
 
 ```text
 [codex-patch] AB request patched: ...

@@ -31,6 +31,9 @@ NO_PROXY_LIST="*"
 PROXY_BYPASS_LIST="*"
 CA_DIR="${HOME}/.mitmproxy"
 CA_CERT="${CA_DIR}/mitmproxy-ca-cert.pem"
+LOG_DIR="${HOME}/Library/Logs/CodexModelBridge"
+MITM_LOG="${LOG_DIR}/mitmdump.log"
+CODEX_LOG="${LOG_DIR}/codex.log"
 
 info() {
     echo "$*" >&2
@@ -242,10 +245,11 @@ ensure_ca() {
     # --- Phase A: Ensure CA file exists ---
     if [ ! -f "$CA_CERT" ]; then
         info "      generating CA"
+        mkdir -p "$LOG_DIR"
 
         # Start mitmdump briefly - CA files are created on first startup.
         # Use a throwaway port with no proxy interception.
-        mitmdump --listen-port 22339 --set block_global=false &
+        mitmdump --listen-port 22339 --set block_global=false >>"$MITM_LOG" 2>&1 &
         local mitm_pid=$!
 
         # Clean up background mitmdump on script exit
@@ -353,9 +357,13 @@ start_proxy_and_open_codex() {
     info "[5/5] starting capture"
     info "      local spec: $MITM_LOCAL_SPEC"
     info "      config: $CONFIG_FILE"
+    info "      logs: $LOG_DIR"
 
     stop_existing_capture
     export MITM_REWRITE_CONFIG="$CONFIG_FILE"
+    mkdir -p "$LOG_DIR"
+    : > "$MITM_LOG"
+    : > "$CODEX_LOG"
 
     local mitmdump_args=(mitmdump)
     mitmdump_args+=(
@@ -363,10 +371,22 @@ start_proxy_and_open_codex() {
         -s "$REWRITE_SCRIPT"
         --flow-detail 0
         --set upstream_cert=false
+        --set connection_strategy=lazy
         --set termlog_verbosity=error
     )
 
-    "${mitmdump_args[@]}" &
+    "${mitmdump_args[@]}" > >(
+        awk -v log="$MITM_LOG" '
+            {
+                print >> log
+                fflush(log)
+            }
+            /\[codex-patch\]/ {
+                print > "/dev/stderr"
+                fflush("/dev/stderr")
+            }
+        '
+    ) 2>&1 &
     local mitm_pid=$!
 
     cleanup_capture() {
@@ -389,7 +409,8 @@ start_proxy_and_open_codex() {
         export no_proxy="$NO_PROXY_LIST"
         exec "$CODEX_EXECUTABLE" \
             --no-proxy-server \
-            --proxy-bypass-list="$PROXY_BYPASS_LIST"
+            --proxy-bypass-list="$PROXY_BYPASS_LIST" \
+            >>"$CODEX_LOG" 2>&1
     ) &
 
     wait "$mitm_pid"

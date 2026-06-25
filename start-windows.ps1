@@ -22,6 +22,11 @@ $NoProxyList = "*"
 $ProxyBypassList = "*"
 $CaDir = Join-Path $env:USERPROFILE ".mitmproxy"
 $CaCert = Join-Path $CaDir "mitmproxy-ca-cert.cer"
+$LogDir = Join-Path $env:LOCALAPPDATA "CodexModelBridge\Logs"
+$MitmOutLog = Join-Path $LogDir "mitmdump.out.log"
+$MitmErrLog = Join-Path $LogDir "mitmdump.err.log"
+$CodexOutLog = Join-Path $LogDir "codex.out.log"
+$CodexErrLog = Join-Path $LogDir "codex.err.log"
 
 function Info([string]$Message) {
     Write-Host $Message
@@ -30,6 +35,14 @@ function Info([string]$Message) {
 function Die([string]$Message) {
     Write-Error $Message
     exit 1
+}
+
+function Initialize-Logs {
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    Set-Content -LiteralPath $MitmOutLog -Value "" -NoNewline
+    Set-Content -LiteralPath $MitmErrLog -Value "" -NoNewline
+    Set-Content -LiteralPath $CodexOutLog -Value "" -NoNewline
+    Set-Content -LiteralPath $CodexErrLog -Value "" -NoNewline
 }
 
 function Get-Config {
@@ -430,7 +443,11 @@ function Start-CodexWithProxyBypass {
     }
 
     try {
-        Start-Process -FilePath $script:CodexExecutable -ArgumentList $launchArgs -ErrorAction Stop | Out-Null
+        Start-Process -FilePath $script:CodexExecutable `
+            -ArgumentList $launchArgs `
+            -RedirectStandardOutput $CodexOutLog `
+            -RedirectStandardError $CodexErrLog `
+            -ErrorAction Stop | Out-Null
     }
     catch {
         $message = $_.Exception.Message
@@ -748,13 +765,15 @@ function Start-CaptureAndOpenCodex {
     Info "[5/5] starting capture"
     Info "      local spec: $MitmLocalSpec"
     Info "      config: $ConfigFile"
+    Info "      logs: $LogDir"
 
     Stop-ExistingCapture
+    Initialize-Logs
     [Environment]::SetEnvironmentVariable("MITM_REWRITE_CONFIG", $ConfigFile, "Process")
 
     $mitm = Start-Process -FilePath $script:MitmDumpCmd `
-        -ArgumentList @("--mode", "local:$MitmLocalSpec", "-s", $RewriteScript, "--flow-detail", "0", "--set", "upstream_cert=false", "--set", "termlog_verbosity=error") `
-        -PassThru -NoNewWindow
+        -ArgumentList @("--mode", "local:$MitmLocalSpec", "-s", $RewriteScript, "--flow-detail", "0", "--set", "upstream_cert=false", "--set", "connection_strategy=lazy", "--set", "termlog_verbosity=error") `
+        -PassThru -WindowStyle Hidden -RedirectStandardOutput $MitmOutLog -RedirectStandardError $MitmErrLog
 
     try {
         Start-Sleep -Seconds 2

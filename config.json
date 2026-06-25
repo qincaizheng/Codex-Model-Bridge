@@ -6,5 +6,7 @@
   "api_key": "",
   "upstream_proxy": "",
   "ab_fallback_timeout_seconds": 8,
+  "enable_i18n": true,
+  "locale_source": "FIRST_AVAILABLE",
   "desired_model": "gpt-5.5"
 }

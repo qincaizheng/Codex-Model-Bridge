@@ -40,6 +40,8 @@ powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
   "api_key": "",
   "upstream_proxy": "",
   "ab_fallback_timeout_seconds": 8,
+  "enable_i18n": true,
+  "locale_source": "FIRST_AVAILABLE",
   "desired_model": "gpt-5.5"
 }
 ```
@@ -59,6 +61,10 @@ powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
 - `ab_fallback_timeout_seconds`：AB 启动请求挂住时触发本地兜底返回的超时
   秒数。设置为 `0` 时保留 mitmproxy 默认 TCP 超时。这个值会作为当前
   helper 进程的 mitmproxy `tcp_timeout` 生效。
+- `enable_i18n`：在 AB initialize 返回体里启用 Codex 的 UI 本地化 layer。
+- `locale_source`：UI 语言来源，可选 `IDE`、`SYSTEM` 或
+  `FIRST_AVAILABLE`。具体手动语言覆盖值是 Codex 本地的 `localeOverride`
+  setting，不是直接放在 AB 返回体里。
 - `desired_model`：要注入并设为默认值的模型。
 
 `host` 和 `path` 不需要配置，项目固定处理：
@@ -83,9 +89,12 @@ Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 启动新的捕获前，脚本会自动停止使用同一个 `rewrite.py` 的旧 mitmdump 捕获进程。
 这只清理旧 mitmdump，不会自动杀掉 Codex 本体。
 
-如果 `ab.chatgpt.com/v1/initialize` 已经进入 mitmproxy，但网络或上游代理不可用，
-或者超过 `ab_fallback_timeout_seconds` 仍未完成，插件会本地构造 Statsig
-initialize 返回值，继续注入配置模型并设置默认模型。
+当 `ab.chatgpt.com/v1/initialize` 进入 addon 后，插件会自己执行这次上游请求。
+如果上游请求失败，或者超过 `ab_fallback_timeout_seconds` 仍未完成，插件会直接
+返回本地构造的 Statsig initialize 值，继续注入配置模型、设置默认模型，并按
+`enable_i18n` 与 `locale_source` 注入 Codex 的 UI 本地化 layer。启动脚本也会
+强制使用 mitmproxy 的 `connection_strategy=lazy`，避免 mitmproxy 在 addon 看到
+请求之前就提前连接上游。
 
 当 `upstream_proxy` 有值时，Codex 本身仍然绕过系统代理，但 mitmdump 会把捕获到
 的出站流量转发给这个上游代理。
@@ -103,7 +112,20 @@ initialize 返回值，继续注入配置模型并设置默认模型。
 
 ## 日志
 
-常见有效日志：
+前台输出会尽量保持简短。macOS 和 Linux 会把 Codex stderr 与 mitmproxy core 日志
+写入本地日志文件，只把包含 `[codex-patch]` 的 addon 行回显到终端。Windows 会把
+mitmdump 输出和直接启动 Codex 时的进程输出写到
+`%LOCALAPPDATA%\CodexModelBridge\Logs`。
+
+日志位置：
+
+```text
+macOS:   ~/Library/Logs/CodexModelBridge/
+Linux:   ${XDG_STATE_HOME:-~/.local/state}/CodexModelBridge/
+Windows: %LOCALAPPDATA%\CodexModelBridge\Logs\
+```
+
+常见有效 addon 日志：
 
 ```text
 [codex-patch] AB request patched: ...

@@ -29,11 +29,15 @@ from mitmproxy import ctx, http
 STATSIG_HOST = "ab.chatgpt.com"
 STATSIG_PATH_PREFIX = "/v1/initialize"
 STATSIG_DYNAMIC_CONFIG_KEYS = ("107580212", "2523198654")
+STATSIG_I18N_LAYER_CONFIG_KEY = "72216192"
+STATSIG_LOCALE_SOURCE_VALUES = ("IDE", "SYSTEM", "FIRST_AVAILABLE")
 
 DEFAULT_DESIRED_MODEL = "gpt-5.5"
 DEFAULT_MODEL_SOURCE = "catalog_json"
 DEFAULT_UPSTREAM_PROXY = ""
 DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS = 8
+DEFAULT_ENABLE_I18N = True
+DEFAULT_LOCALE_SOURCE = "FIRST_AVAILABLE"
 
 STALE_HEADERS = ("content-length", "etag", "last-modified", "content-md5")
 FALLBACK_RESPONSE_HEADERS = {
@@ -108,6 +112,27 @@ def _remove_stale_headers(headers) -> None:
             pass
 
 
+def _upstream_request_headers(headers) -> dict[str, str]:
+    skipped = {
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "host",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+    result: dict[str, str] = {}
+    for name, value in headers.items(multi=True):
+        if name.lower() not in skipped:
+            result[name] = value
+    result["Accept-Encoding"] = "identity"
+    return result
+
+
 def _request_path(request) -> str:
     return request.path.split("?", 1)[0]
 
@@ -140,6 +165,25 @@ def _is_statsig_initialize(request) -> bool:
 def _is_models_response_candidate(request) -> bool:
     path = _request_path(request).rstrip("/")
     return request.method.upper() == "GET" and path.endswith("/models")
+
+
+def _context_hosts(context) -> tuple[str, ...]:
+    hosts: list[str] = []
+    for conn_name in ("client", "server"):
+        conn = getattr(context, conn_name, None)
+        for value in (
+            getattr(conn, "sni", None),
+            getattr(conn, "address", (None, None))[0]
+            if getattr(conn, "address", None)
+            else None,
+        ):
+            if isinstance(value, str) and value:
+                hosts.append(value.split(":", 1)[0].lower())
+    return tuple(dict.fromkeys(hosts))
+
+
+def _context_matches_host(context, expected: str) -> bool:
+    return expected.lower() in _context_hosts(context)
 
 
 def _query_value(request, name: str) -> str | None:
@@ -229,6 +273,18 @@ def _parse_timeout_seconds(value: Any, default: int) -> int:
     return default
 
 
+def _parse_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    return default
+
+
 def _compact_value(value: Any) -> str:
     if isinstance(value, bool):
         return str(value).lower()
@@ -246,13 +302,15 @@ class CodexCatalogPatcher:
         self.desired_model = DEFAULT_DESIRED_MODEL
         self.upstream_proxy = DEFAULT_UPSTREAM_PROXY
         self.ab_fallback_timeout_seconds = DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS
+        self.enable_i18n = DEFAULT_ENABLE_I18N
+        self.locale_source = DEFAULT_LOCALE_SOURCE
         self.upstream_via: tuple[str, tuple[str, int]] | None = None
         self.catalog_models: list[dict[str, Any]] = []
         self.catalog_slugs: list[str] = []
 
     def load(self, loader) -> None:
         self._load_config()
-        self._apply_timeout_option()
+        self._apply_runtime_options()
         self._load_model_sources()
 
     def _apply_upstream_proxy(self, server) -> None:
@@ -271,6 +329,27 @@ class CodexCatalogPatcher:
 
     def server_connect(self, data) -> None:
         self._apply_upstream_proxy(data.server)
+
+    def tls_clienthello(self, data) -> None:
+        sni = getattr(data.client_hello, "sni", None)
+        if sni != STATSIG_HOST:
+            return
+        _log("error", f"[codex-patch] AB TLS clienthello: sni={sni}")
+
+    def tls_established_client(self, data) -> None:
+        if not _context_matches_host(data.context, STATSIG_HOST):
+            return
+        _log("error", f"[codex-patch] AB TLS client established: hosts={_context_hosts(data.context)}")
+
+    def tls_failed_client(self, data) -> None:
+        if not _context_matches_host(data.context, STATSIG_HOST):
+            return
+        _log("error", f"[codex-patch] AB TLS client failed: hosts={_context_hosts(data.context)}")
+
+    def tls_failed_server(self, data) -> None:
+        if not _context_matches_host(data.context, STATSIG_HOST):
+            return
+        _log("error", f"[codex-patch] AB TLS server failed: hosts={_context_hosts(data.context)}")
 
     def requestheaders(self, flow) -> None:
         self._apply_upstream_proxy(flow.server_conn)
@@ -309,6 +388,7 @@ class CodexCatalogPatcher:
             f"[codex-patch] AB request patched: host={getattr(request, 'pretty_host', request.host)} "
             f"path={_request_path(request)} encoded_se={encoded}",
         )
+        self._resolve_statsig_request(flow)
 
     def response(self, flow) -> None:
         request = flow.request
@@ -351,6 +431,8 @@ class CodexCatalogPatcher:
             "ab_fallback_timeout_seconds",
             DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS,
         )
+        enable_i18n = config.get("enable_i18n", DEFAULT_ENABLE_I18N)
+        locale_source = config.get("locale_source", DEFAULT_LOCALE_SOURCE)
 
         if isinstance(model_source, str) and model_source:
             self.model_source = model_source
@@ -368,6 +450,17 @@ class CodexCatalogPatcher:
             ab_fallback_timeout_seconds,
             DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS,
         )
+        self.enable_i18n = _parse_bool(enable_i18n, DEFAULT_ENABLE_I18N)
+        if isinstance(locale_source, str) and locale_source.strip():
+            normalized_locale_source = locale_source.strip().upper()
+            if normalized_locale_source in STATSIG_LOCALE_SOURCE_VALUES:
+                self.locale_source = normalized_locale_source
+            else:
+                _log(
+                    "error",
+                    "[codex-patch] Invalid locale_source="
+                    f"{locale_source}; using {DEFAULT_LOCALE_SOURCE}",
+                )
         if isinstance(upstream_proxy, str):
             self.upstream_proxy = upstream_proxy.strip()
             try:
@@ -383,16 +476,20 @@ class CodexCatalogPatcher:
             f"api_base_url={self.api_base_url or '<unset>'}, "
             f"desired_model={self.desired_model}, "
             f"upstream_proxy={self.upstream_proxy or '<direct>'}, "
-            f"ab_fallback_timeout_seconds={self.ab_fallback_timeout_seconds}",
+            f"ab_fallback_timeout_seconds={self.ab_fallback_timeout_seconds}, "
+            f"enable_i18n={_compact_value(self.enable_i18n)}, "
+            f"locale_source={self.locale_source}",
         )
 
-    def _apply_timeout_option(self) -> None:
-        if self.ab_fallback_timeout_seconds <= 0:
-            return
+    def _apply_runtime_options(self) -> None:
         options = getattr(ctx, "options", None)
         if options is None or not hasattr(options, "update"):
             return
-        options.update(tcp_timeout=self.ab_fallback_timeout_seconds)
+
+        updates: dict[str, Any] = {"connection_strategy": "lazy"}
+        if self.ab_fallback_timeout_seconds > 0:
+            updates["tcp_timeout"] = self.ab_fallback_timeout_seconds
+        options.update(**updates)
 
     def _load_model_sources(self) -> None:
         models: list[dict[str, Any]] = []
@@ -434,6 +531,54 @@ class CodexCatalogPatcher:
             "info",
             f"[codex-patch] Loaded {len(self.catalog_slugs)} model(s) from "
             f"source={self.model_source}",
+        )
+
+    def _resolve_statsig_request(self, flow) -> None:
+        timeout = self.ab_fallback_timeout_seconds
+        if timeout <= 0:
+            return
+
+        request = flow.request
+        url = f"https://{STATSIG_HOST}{request.path}"
+        data = _read_text(request).encode("utf-8")
+        upstream_request = urllib.request.Request(
+            url,
+            data=data,
+            headers=_upstream_request_headers(request.headers),
+            method="POST",
+        )
+
+        try:
+            with self._url_opener().open(upstream_request, timeout=timeout) as response:
+                flow.response = http.Response.make(
+                    getattr(response, "status", response.getcode()),
+                    response.read(),
+                    dict(response.headers.items()),
+                )
+        except urllib.error.HTTPError as exc:
+            flow.response = http.Response.make(
+                exc.code,
+                exc.read(),
+                dict(exc.headers.items()) if exc.headers else {},
+            )
+        except Exception as exc:
+            self._set_statsig_fallback_response(
+                flow,
+                reason=f"request_error:{type(exc).__name__}",
+            )
+            return
+
+        self._patch_statsig_response(flow, flow.response)
+
+    def _url_opener(self):
+        if not self.upstream_proxy:
+            return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        proxy = self.upstream_proxy
+        if "://" not in proxy:
+            proxy = "http://" + proxy
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
 
     def _load_catalog_models(self) -> list[dict[str, Any]]:
@@ -603,6 +748,7 @@ class CodexCatalogPatcher:
             return
 
         changed = self._patch_statsig_dynamic_configs(body)
+        self._patch_statsig_layer_configs(body)
         after = self._statsig_body_summary(body)
         if not changed:
             _log(
@@ -655,11 +801,14 @@ class CodexCatalogPatcher:
 
     def _statsig_body_summary(self, body: dict[str, Any]) -> str:
         dynamic_configs = body.get("dynamic_configs")
-        values = body.get("values")
         if not isinstance(dynamic_configs, dict):
             return f"dynamic_configs_type={type(dynamic_configs).__name__}"
 
         parts = [f"dynamic_configs={len(dynamic_configs)}"]
+        layer_configs = body.get("layer_configs")
+        if isinstance(layer_configs, dict):
+            parts.append(f"layer_configs={len(layer_configs)}")
+
         missing: list[str] = []
         for key in STATSIG_DYNAMIC_CONFIG_KEYS:
             entry = dynamic_configs.get(key)
@@ -679,6 +828,16 @@ class CodexCatalogPatcher:
             parts.append(f"{key}=" + ",".join(target_parts))
         if missing:
             parts.append("missing=" + ",".join(missing))
+
+        i18n = self._i18n_layer_summary(body)
+        if i18n.get("present"):
+            parts.append(
+                f"{STATSIG_I18N_LAYER_CONFIG_KEY}=shape:{i18n.get('shape', '<none>')},"
+                f"i18n:{_compact_value(i18n.get('enable_i18n'))},"
+                f"source:{_compact_value(i18n.get('locale_source'))}"
+            )
+        else:
+            parts.append(f"missing_layer={STATSIG_I18N_LAYER_CONFIG_KEY}")
         return " ".join(parts)
 
     def _build_statsig_fallback_body(self) -> dict[str, Any]:
@@ -697,10 +856,14 @@ class CodexCatalogPatcher:
                 "is_user_in_experiment": True,
             }
 
+        layer_configs = {
+            STATSIG_I18N_LAYER_CONFIG_KEY: self._build_i18n_layer_entry({}),
+        }
+
         return {
             "feature_gates": {},
             "dynamic_configs": dynamic_configs,
-            "layer_configs": {},
+            "layer_configs": layer_configs,
             "sdkParams": {},
             "has_updates": True,
             "generator": "codex-model-bridge",
@@ -767,6 +930,37 @@ class CodexCatalogPatcher:
             )
         return result
 
+    def _i18n_layer_summary(self, body: dict[str, Any]) -> dict[str, Any]:
+        layer_configs = body.get("layer_configs")
+        if not isinstance(layer_configs, dict):
+            return {"present": False}
+
+        entry = layer_configs.get(STATSIG_I18N_LAYER_CONFIG_KEY)
+        if not isinstance(entry, dict):
+            return {"present": False}
+
+        value = entry.get("value")
+        shape = "value" if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            ref = entry.get("v")
+            values = body.get("values")
+            if isinstance(values, list) and isinstance(ref, int) and 0 <= ref < len(values):
+                value = values[ref]
+                shape = "compact"
+
+        result: dict[str, Any] = {
+            "present": True,
+            "shape": shape or "unknown",
+        }
+        if isinstance(value, dict):
+            result.update(
+                {
+                    "enable_i18n": value.get("enable_i18n"),
+                    "locale_source": value.get("locale_source"),
+                }
+            )
+        return result
+
     def _patch_statsig_dynamic_configs(self, body: dict[str, Any]) -> bool:
         dynamic_configs = body.get("dynamic_configs")
         if not isinstance(dynamic_configs, dict):
@@ -789,6 +983,19 @@ class CodexCatalogPatcher:
             )
         return changed
 
+    def _patch_statsig_layer_configs(self, body: dict[str, Any]) -> bool:
+        layer_configs = body.get("layer_configs")
+        if not isinstance(layer_configs, dict):
+            layer_configs = {}
+            body["layer_configs"] = layer_configs
+
+        entry = layer_configs.get(STATSIG_I18N_LAYER_CONFIG_KEY)
+        if not isinstance(entry, dict):
+            layer_configs[STATSIG_I18N_LAYER_CONFIG_KEY] = self._build_i18n_layer_entry({})
+            return True
+
+        return self._patch_i18n_layer_entry(body, entry)
+
     def _patch_statsig_entry(self, body: dict[str, Any], entry: dict[str, Any]) -> bool:
         value = entry.get("value")
         if isinstance(value, dict):
@@ -803,6 +1010,51 @@ class CodexCatalogPatcher:
                 values[ref] = self._merged_statsig_value(current)
                 return True
         return False
+
+    def _patch_i18n_layer_entry(self, body: dict[str, Any], entry: dict[str, Any]) -> bool:
+        self._ensure_explicit_parameters(entry, ("enable_i18n", "locale_source"))
+
+        value = entry.get("value")
+        if isinstance(value, dict):
+            entry["value"] = self._merged_i18n_layer_value(value)
+            return True
+
+        ref = entry.get("v")
+        values = body.get("values")
+        if isinstance(values, list) and isinstance(ref, int) and 0 <= ref < len(values):
+            current = values[ref]
+            if isinstance(current, dict):
+                values[ref] = self._merged_i18n_layer_value(current)
+                return True
+
+        entry.pop("v", None)
+        entry["value"] = self._merged_i18n_layer_value({})
+        return True
+
+    def _build_i18n_layer_entry(self, existing: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": STATSIG_I18N_LAYER_CONFIG_KEY,
+            "value": self._merged_i18n_layer_value(existing),
+            "rule_id": "codex_model_bridge_i18n",
+            "group": "codex_model_bridge_i18n",
+            "id_type": "userID",
+            "secondary_exposures": [],
+            "undelegated_secondary_exposures": [],
+            "explicit_parameters": ["enable_i18n", "locale_source"],
+            "is_device_based": False,
+            "is_experiment_active": True,
+            "is_user_in_experiment": True,
+        }
+
+    @staticmethod
+    def _ensure_explicit_parameters(entry: dict[str, Any], names: tuple[str, ...]) -> None:
+        explicit = entry.get("explicit_parameters")
+        if not isinstance(explicit, list):
+            explicit = []
+        for name in names:
+            if name not in explicit:
+                explicit.append(name)
+        entry["explicit_parameters"] = explicit
 
     def _merged_statsig_value(self, existing: dict[str, Any]) -> dict[str, Any]:
         merged = deepcopy(existing)
@@ -823,6 +1075,12 @@ class CodexCatalogPatcher:
         merged["available_models"] = result
         merged["use_hidden_models"] = True
         merged["default_model"] = self.desired_model
+        return merged
+
+    def _merged_i18n_layer_value(self, existing: dict[str, Any]) -> dict[str, Any]:
+        merged = deepcopy(existing)
+        merged["enable_i18n"] = self.enable_i18n
+        merged["locale_source"] = self.locale_source
         return merged
 
 
