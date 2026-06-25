@@ -1,0 +1,9 @@
+{
+  "codex_app_path": "",
+  "model_source": "catalog_json",
+  "catalog_json": "~/.codex/models_catalog.json",
+  "api_base_url": "",
+  "api_key": "",
+  "upstream_proxy": "",
+  "desired_model": "gpt-5.5"
+}
