@@ -91,13 +91,19 @@ Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 
 当 `ab.chatgpt.com/v1/initialize` 进入 addon 后，插件会自己执行这次上游请求。
 如果上游请求失败，或者超过 `ab_fallback_timeout_seconds` 仍未完成，插件会直接
-返回本地构造的 Statsig initialize 值，继续注入配置模型、设置默认模型，并按
-`enable_i18n` 与 `locale_source` 注入 Codex 的 UI 本地化 layer。启动脚本也会
+返回缓存/模板版本的 Statsig initialize 值，保留上次上游成功响应的字段，同时继续
+注入配置模型、设置默认模型，并按 `enable_i18n` 与 `locale_source` 注入 Codex
+的 UI 本地化 layer。首次运行或没有缓存快照时，使用脱敏的初始化模板
+（`statsig-fallback/init-template.json`）并将其写入本地缓存。启动脚本也会
 强制使用 mitmproxy 的 `connection_strategy=lazy`，避免 mitmproxy 在 addon 看到
 请求之前就提前连接上游。
 
 当 `upstream_proxy` 有值时，Codex 本身仍然绕过系统代理，但 mitmdump 会把捕获到
 的出站流量转发给这个上游代理。
+
+新机器第一次启动时，建议先保证可用的代理链路：开启代理客户端的 TUN 模式，或在
+`config.json` 里配置 `upstream_proxy`。这样 addon 更容易先拿到并保存一份真实上游
+Statsig 快照，之后再进入模板兜底时字段会更完整。
 
 ## 平台说明
 

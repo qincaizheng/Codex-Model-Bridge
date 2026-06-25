@@ -1,0 +1,3 @@
+# Runtime Statsig cache — saved from the last successful upstream response.
+# Do not commit: contains dynamic upstream data.
+snapshot.cache.json

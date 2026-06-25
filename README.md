@@ -90,10 +90,13 @@ Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 
 When the startup request to `ab.chatgpt.com/v1/initialize` enters the addon,
 the addon performs the upstream request itself. If that upstream request fails
-or exceeds `ab_fallback_timeout_seconds`, the addon directly returns a local
-fallback Statsig initialize response with the configured models and desired
-default. It also injects Codex's UI localization layer using `enable_i18n` and
-`locale_source`. The launchers also force mitmproxy's `connection_strategy=lazy`,
+or exceeds `ab_fallback_timeout_seconds`, the addon returns a cached/template
+Statsig initialize response that preserves fields from the last successful
+upstream response, while still applying the configured models, desired default,
+and UI localization layer (`enable_i18n`, `locale_source`). On the first run
+or when no cached snapshot exists, a sanitized initialization template
+(`statsig-fallback/init-template.json`) is used and seeded into the local cache.
+The launchers also force mitmproxy's `connection_strategy=lazy`,
 so mitmproxy does not try to connect upstream before the addon can see the
 request.
 
@@ -110,6 +113,11 @@ On startup the launcher:
 
 When `upstream_proxy` is set, Codex is still launched without the system proxy,
 but mitmdump forwards captured outbound traffic through that proxy.
+
+For the first run on a new machine, prefer starting with a working proxy path:
+enable your proxy client's TUN mode or set `upstream_proxy` in `config.json`.
+That gives the addon a better chance to fetch and save a real upstream Statsig
+snapshot before it ever needs the template fallback.
 
 ## Platform Notes
 

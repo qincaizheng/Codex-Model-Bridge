@@ -51,6 +51,10 @@ REQUEST_DELTA_KEYS = (
     "partialUserMatchSinceTime",
 )
 
+STATSIG_FALLBACK_DIR = "statsig-fallback"
+STATSIG_SNAPSHOT_CACHE_FILE = "snapshot.cache.json"
+STATSIG_INIT_TEMPLATE_FILE = "init-template.json"
+
 
 def _config_path() -> str:
     return os.environ.get(
@@ -61,6 +65,18 @@ def _config_path() -> str:
 
 def _script_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _statsig_snapshot_dir() -> str:
+    return os.path.join(_script_dir(), STATSIG_FALLBACK_DIR)
+
+
+def _statsig_snapshot_path() -> str:
+    return os.path.join(_statsig_snapshot_dir(), STATSIG_SNAPSHOT_CACHE_FILE)
+
+
+def _statsig_init_template_path() -> str:
+    return os.path.join(_statsig_snapshot_dir(), STATSIG_INIT_TEMPLATE_FILE)
 
 
 DEFAULT_CATALOG_JSON = ""
@@ -307,6 +323,7 @@ class CodexCatalogPatcher:
         self.upstream_via: tuple[str, tuple[str, int]] | None = None
         self.catalog_models: list[dict[str, Any]] = []
         self.catalog_slugs: list[str] = []
+        self._snapshot_dir_ensured = False
 
     def load(self, loader) -> None:
         self._load_config()
@@ -734,12 +751,13 @@ class CodexCatalogPatcher:
         if not flow.metadata.get("codex_patch_statsig_initialize") and not _is_statsig_initialize(flow.request):
             return
 
+        status = getattr(response, "status_code", 0)
+        if isinstance(status, int) and status >= 500:
+            self._set_statsig_fallback_response(flow, reason=f"status_{status}")
+            return
+
         body = self._read_json_response(response)
         if body is None or not isinstance(body, dict):
-            status = getattr(response, "status_code", 0)
-            if isinstance(status, int) and status >= 500:
-                self._set_statsig_fallback_response(flow, reason=f"status_{status}")
-                return
             _log(
                 "error",
                 f"[codex-patch] AB response patch failed: host={getattr(flow.request, 'pretty_host', flow.request.host)} "
@@ -750,6 +768,7 @@ class CodexCatalogPatcher:
         changed = self._patch_statsig_dynamic_configs(body)
         self._patch_statsig_layer_configs(body)
         after = self._statsig_body_summary(body)
+
         if not changed:
             _log(
                 "error",
@@ -757,8 +776,14 @@ class CodexCatalogPatcher:
                 f"path={_request_path(flow.request)} {after}",
             )
             return
+        # Normalize hash_used to "none" so injected plaintext dynamic/layer
+        # config keys are found by the Statsig SDK.
+        body["hash_used"] = "none"
+
+        self._save_statsig_snapshot(body)
 
         response.set_text(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+
         _remove_stale_headers(response.headers)
         _log(
             "error",
@@ -840,21 +865,69 @@ class CodexCatalogPatcher:
             parts.append(f"missing_layer={STATSIG_I18N_LAYER_CONFIG_KEY}")
         return " ".join(parts)
 
+    def _ensure_snapshot_dir(self) -> None:
+        if self._snapshot_dir_ensured:
+            return
+        path = _statsig_snapshot_dir()
+        try:
+            os.makedirs(path, exist_ok=True)
+            self._snapshot_dir_ensured = True
+        except OSError as exc:
+            _log("error", f"[codex-patch] Failed to create snapshot dir {path}: {exc}")
+
+    def _save_statsig_snapshot(self, body: dict[str, Any]) -> None:
+        self._ensure_snapshot_dir()
+        path = _statsig_snapshot_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False, separators=(",", ":"))
+        except OSError as exc:
+            _log("error", f"[codex-patch] Failed to save Statsig snapshot to {path}: {exc}")
+
+    def _load_statsig_snapshot_or_template(self) -> dict[str, Any] | None:
+        snapshot_path = _statsig_snapshot_path()
+        template_path = _statsig_init_template_path()
+
+        if not os.path.isfile(snapshot_path):
+            if os.path.isfile(template_path):
+                try:
+                    self._ensure_snapshot_dir()
+                    with open(template_path, encoding="utf-8") as src:
+                        template_body = json.load(src)
+                    if not isinstance(template_body, dict):
+                        raise ValueError("init-template.json is not a JSON object")
+                    with open(snapshot_path, "w", encoding="utf-8") as dst:
+                        json.dump(template_body, dst, ensure_ascii=False, separators=(",", ":"))
+                    _log("info", "[codex-patch] Statsig snapshot seeded from init-template.json")
+                except (OSError, json.JSONDecodeError, ValueError) as exc:
+                    _log("error", f"[codex-patch] Failed to seed snapshot from template: {exc}")
+                    return None
+            else:
+                _log("error", f"[codex-patch] Statsig init-template not found: {template_path}")
+                return None
+
+        try:
+            with open(snapshot_path, encoding="utf-8") as f:
+                body = json.load(f)
+            if not isinstance(body, dict):
+                raise ValueError("snapshot cache is not a JSON object")
+            if body.get("hash_used", "none") != "none":
+                _log(
+                    "warn",
+                    "[codex-patch] Statsig snapshot hash_used="
+                    f"{body.get('hash_used')} differs from plaintext key format; "
+                    "normalizing to 'none'",
+                )
+                body["hash_used"] = "none"
+            return body
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _log("error", f"[codex-patch] Failed to load Statsig snapshot {snapshot_path}: {exc}")
+            return None
+
     def _build_statsig_fallback_body(self) -> dict[str, Any]:
         dynamic_configs: dict[str, Any] = {}
         for key in STATSIG_DYNAMIC_CONFIG_KEYS:
-            dynamic_configs[key] = {
-                "name": key,
-                "value": self._merged_statsig_value({}),
-                "rule_id": "codex_model_bridge_fallback",
-                "group": "codex_model_bridge_fallback",
-                "id_type": "userID",
-                "secondary_exposures": [],
-                "explicit_parameters": [],
-                "is_device_based": False,
-                "is_experiment_active": True,
-                "is_user_in_experiment": True,
-            }
+            dynamic_configs[key] = self._build_statsig_dynamic_config_entry(key)
 
         layer_configs = {
             STATSIG_I18N_LAYER_CONFIG_KEY: self._build_i18n_layer_entry({}),
@@ -883,7 +956,14 @@ class CodexCatalogPatcher:
         }
 
     def _set_statsig_fallback_response(self, flow, reason: str) -> None:
-        body = self._build_statsig_fallback_body()
+        body = self._load_statsig_snapshot_or_template()
+        if body is not None:
+            self._patch_statsig_dynamic_configs(body)
+            self._patch_statsig_layer_configs(body)
+            body["time"] = int(time.time() * 1000)
+            body["hash_used"] = "none"
+        else:
+            body = self._build_statsig_fallback_body()
         flow.response = http.Response.make(
             200,
             json.dumps(body, ensure_ascii=False, separators=(",", ":")),
@@ -971,8 +1051,10 @@ class CodexCatalogPatcher:
         for key in STATSIG_DYNAMIC_CONFIG_KEYS:
             entry = dynamic_configs.get(key)
             if not isinstance(entry, dict):
-                continue
-            if self._patch_statsig_entry(body, entry):
+                dynamic_configs[key] = self._build_statsig_dynamic_config_entry(key)
+                _log("info", f"[codex-patch] Statsig dynamic config key {key} injected (missing in upstream)")
+                changed = True
+            elif self._patch_statsig_entry(body, entry):
                 changed = True
 
         if not changed:
@@ -982,6 +1064,20 @@ class CodexCatalogPatcher:
                 "could not be patched",
             )
         return changed
+
+    def _build_statsig_dynamic_config_entry(self, key: str) -> dict[str, Any]:
+        return {
+            "name": key,
+            "value": self._merged_statsig_value({}),
+            "rule_id": "codex_model_bridge_fallback",
+            "group": "codex_model_bridge_fallback",
+            "id_type": "userID",
+            "secondary_exposures": [],
+            "explicit_parameters": [],
+            "is_device_based": False,
+            "is_experiment_active": True,
+            "is_user_in_experiment": True,
+        }
 
     def _patch_statsig_layer_configs(self, body: dict[str, Any]) -> bool:
         layer_configs = body.get("layer_configs")
