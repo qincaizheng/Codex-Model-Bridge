@@ -1,4 +1,4 @@
-# start-windows.ps1 - Single-run mitmdump local capture helper for Codex.
+# start-windows.ps1 - Single-run mitmdump local capture helper for ChatGPT and legacy Codex.
 
 $ErrorActionPreference = "Stop"
 
@@ -11,13 +11,15 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RewriteScript = Join-Path $ScriptDir "rewrite.py"
 $ConfigFile = Join-Path $ScriptDir "config.json"
 
-$script:TargetApp = "Codex"
+$script:TargetApp = "ChatGPT"
 $script:CodexAppPath = ""
 $script:CodexExecutable = ""
 $script:CodexAliasExecutable = ""
+$script:CodexAlternateAliasExecutable = ""
 $script:CodexAumid = ""
+$script:CodexPackageInstallLocation = ""
 $script:MitmDumpCmd = ""
-$MitmLocalSpec = "Codex.exe,codex.exe,Codex,codex"
+$MitmLocalSpec = "ChatGPT.exe,chatgpt.exe,ChatGPT,chatgpt,Codex.exe,codex.exe,Codex,codex"
 $NoProxyList = "*"
 $ProxyBypassList = "*"
 $CaDir = Join-Path $env:USERPROFILE ".mitmproxy"
@@ -73,11 +75,17 @@ function Expand-LocalPath([string]$Path) {
         return ""
     }
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    if ($expanded -eq "~") {
+        return $env:USERPROFILE
+    }
     if ($expanded.StartsWith("~\")) {
         return Join-Path $env:USERPROFILE $expanded.Substring(2)
     }
     if ($expanded.StartsWith("~/")) {
         return Join-Path $env:USERPROFILE $expanded.Substring(2)
+    }
+    if (-not [IO.Path]::IsPathRooted($expanded)) {
+        return Join-Path $ScriptDir $expanded
     }
     return $expanded
 }
@@ -89,20 +97,29 @@ function Normalize-LocalPath([string]$Path) {
     return $Path.Replace('/', '\').TrimEnd('\')
 }
 
-function Get-CodexAliasExecutable {
+function Get-CodexAliasExecutables([string]$ExecutablePath) {
+    $resolvedName = Split-Path -Leaf $ExecutablePath
+    $aliasNames = if ($resolvedName -ieq "Codex.exe") {
+        @("Codex.exe", "ChatGPT.exe")
+    }
+    else {
+        @("ChatGPT.exe", "Codex.exe")
+    }
+
     $candidates = @()
-    $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\Codex.exe"
-    if (Test-Path -LiteralPath $alias -PathType Leaf) {
-        $candidates += (Resolve-Path -LiteralPath $alias).Path
+    foreach ($aliasName in $aliasNames) {
+        $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\$aliasName"
+        if (Test-Path -LiteralPath $alias -PathType Leaf) {
+            $candidates += (Resolve-Path -LiteralPath $alias).Path
+        }
+
+        $command = Get-Command $aliasName -ErrorAction SilentlyContinue
+        if ($command -and $command.Source -and $command.Source -like "*\Microsoft\WindowsApps\*") {
+            $candidates += $command.Source
+        }
     }
 
-    $command = Get-Command Codex.exe -ErrorAction SilentlyContinue
-    if ($command -and $command.Source -and $command.Source -like "*\Microsoft\WindowsApps\*") {
-        $candidates += $command.Source
-    }
-
-    $result = $candidates | Where-Object { $_ } | Select-Object -First 1
-    return $result
+    return @($candidates | Where-Object { $_ } | Select-Object -Unique)
 }
 
 function Get-AumidFromPackage([object]$Package, [string]$ExecutablePath) {
@@ -166,6 +183,7 @@ function Get-AumidFromPackagePath([string]$ExecutablePath) {
         }
         if ($normalizedExecutable.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
             $normalizedExecutable.StartsWith($root + "\", [StringComparison]::OrdinalIgnoreCase)) {
+            $script:CodexPackageInstallLocation = $root
             return Get-AumidFromPackage $package $normalizedExecutable
         }
     }
@@ -173,21 +191,62 @@ function Get-AumidFromPackagePath([string]$ExecutablePath) {
     return ""
 }
 
-function Get-CodexAumidFromStartApps {
+function Set-CodexPackageInstallLocationFromAumid([string]$ExecutablePath, [string]$Aumid) {
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -or
+        -not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    $normalizedExecutable = Normalize-LocalPath $ExecutablePath
+    $aliasRoot = Normalize-LocalPath (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps")
+    if ([string]::IsNullOrWhiteSpace($normalizedExecutable) -or
+        [IO.Path]::GetDirectoryName($normalizedExecutable) -ine $aliasRoot) {
+        return
+    }
+
+    if ($Aumid -notmatch '^(?<PackageFamilyName>[^!\\/: \t\r\n]+)![^!\\/: \t\r\n]+$') {
+        return
+    }
+    $packageFamilyName = $Matches["PackageFamilyName"]
+
+    $packages = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+        $_.InstallLocation -and $_.PackageFamilyName -ieq $packageFamilyName
+    })
+    if ($packages.Count -ne 1) {
+        return
+    }
+
+    $root = Normalize-LocalPath $packages[0].InstallLocation
+    if (-not [string]::IsNullOrWhiteSpace($root)) {
+        $script:CodexPackageInstallLocation = $root
+    }
+}
+
+function Get-CodexAumidFromStartApps([string]$ExecutablePath) {
     if (-not (Get-Command Get-StartApps -ErrorAction SilentlyContinue)) {
         return ""
     }
 
+    $resolvedName = [IO.Path]::GetFileNameWithoutExtension($ExecutablePath)
+    $targetNames = if ($resolvedName -ieq "Codex") {
+        @("Codex", "ChatGPT")
+    }
+    else {
+        @("ChatGPT", "Codex")
+    }
+
     $apps = @(Get-StartApps -ErrorAction SilentlyContinue)
-    $exact = $apps | Where-Object {
-        $_.Name -ieq "Codex" -or $_.AppID -match "(?i)(^|[._!])codex([._!]|$)"
-    } | Select-Object -First 1
-    if ($exact -and $exact.AppID) {
-        return $exact.AppID
+    foreach ($targetName in $targetNames) {
+        $exact = $apps | Where-Object {
+            $_.Name -ieq $targetName -or $_.AppID -match "(?i)(^|[._!])$([regex]::Escape($targetName))([._!]|$)"
+        } | Select-Object -First 1
+        if ($exact -and $exact.AppID) {
+            return $exact.AppID
+        }
     }
 
     $fuzzy = $apps | Where-Object {
-        $_.Name -match "(?i)codex" -or $_.AppID -match "(?i)codex"
+        $_.Name -match "(?i)(chatgpt|codex)" -or $_.AppID -match "(?i)(chatgpt|codex)"
     } | Select-Object -First 1
     if ($fuzzy -and $fuzzy.AppID) {
         return $fuzzy.AppID
@@ -196,7 +255,7 @@ function Get-CodexAumidFromStartApps {
     return ""
 }
 
-function Get-CodexAumidFromAppsFolder {
+function Get-CodexAumidFromAppsFolder([string]$ExecutablePath) {
     try {
         $apps = (New-Object -ComObject Shell.Application).NameSpace('shell:::{4234d49b-0245-4df3-b780-3893943456e1}').Items()
     }
@@ -204,15 +263,25 @@ function Get-CodexAumidFromAppsFolder {
         return ""
     }
 
-    $exact = $apps | Where-Object {
-        $_.Name -ieq "Codex" -or $_.Path -match "(?i)(^|[._!])codex([._!]|$)"
-    } | Select-Object -First 1
-    if ($exact -and $exact.Path) {
-        return $exact.Path
+    $resolvedName = [IO.Path]::GetFileNameWithoutExtension($ExecutablePath)
+    $targetNames = if ($resolvedName -ieq "Codex") {
+        @("Codex", "ChatGPT")
+    }
+    else {
+        @("ChatGPT", "Codex")
+    }
+
+    foreach ($targetName in $targetNames) {
+        $exact = $apps | Where-Object {
+            $_.Name -ieq $targetName -or $_.Path -match "(?i)(^|[._!])$([regex]::Escape($targetName))([._!]|$)"
+        } | Select-Object -First 1
+        if ($exact -and $exact.Path) {
+            return $exact.Path
+        }
     }
 
     $fuzzy = $apps | Where-Object {
-        $_.Name -match "(?i)codex" -or $_.Path -match "(?i)codex"
+        $_.Name -match "(?i)(chatgpt|codex)" -or $_.Path -match "(?i)(chatgpt|codex)"
     } | Select-Object -First 1
     if ($fuzzy -and $fuzzy.Path) {
         return $fuzzy.Path
@@ -227,19 +296,33 @@ function Resolve-CodexAumid([string]$ExecutablePath) {
         return $aumid
     }
 
-    $aumid = Get-CodexAumidFromStartApps
+    $aumid = Get-CodexAumidFromStartApps $ExecutablePath
     if (-not [string]::IsNullOrWhiteSpace($aumid)) {
+        Set-CodexPackageInstallLocationFromAumid $ExecutablePath $aumid
         return $aumid
     }
 
-    return Get-CodexAumidFromAppsFolder
+    $aumid = Get-CodexAumidFromAppsFolder $ExecutablePath
+    if (-not [string]::IsNullOrWhiteSpace($aumid)) {
+        Set-CodexPackageInstallLocationFromAumid $ExecutablePath $aumid
+    }
+    return $aumid
 }
 
 function Set-CodexExecutable([string]$Path) {
     $script:CodexExecutable = (Resolve-Path -LiteralPath $Path).Path
     $script:CodexAppPath = $script:CodexExecutable
     $script:TargetApp = Split-Path -Leaf $script:CodexExecutable
-    $script:CodexAliasExecutable = Get-CodexAliasExecutable
+    $resolvedName = Split-Path -Leaf $script:CodexExecutable
+    $alternateName = if ($resolvedName -ieq "Codex.exe") { "ChatGPT.exe" } else { "Codex.exe" }
+    $aliases = @(Get-CodexAliasExecutables $script:CodexExecutable)
+    $script:CodexAliasExecutable = $aliases |
+        Where-Object { (Split-Path -Leaf $_) -ieq $resolvedName } |
+        Select-Object -First 1
+    $script:CodexAlternateAliasExecutable = $aliases |
+        Where-Object { (Split-Path -Leaf $_) -ieq $alternateName } |
+        Select-Object -First 1
+    $script:CodexPackageInstallLocation = ""
     $script:CodexAumid = Resolve-CodexAumid $script:CodexExecutable
 }
 
@@ -248,15 +331,17 @@ function Find-CodexExeUnder([string]$Root, [int]$Depth) {
         return $null
     }
 
-    $direct = Join-Path $Root "Codex.exe"
-    if (Test-Path -LiteralPath $direct -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $direct).Path
-    }
+    foreach ($executableName in @("ChatGPT.exe", "Codex.exe")) {
+        $direct = Join-Path $Root $executableName
+        if (Test-Path -LiteralPath $direct -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $direct).Path
+        }
 
-    $match = Get-ChildItem -LiteralPath $Root -Filter "Codex.exe" -File -Recurse -Depth $Depth -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($match) {
-        return $match.FullName
+        $match = Get-ChildItem -LiteralPath $Root -Filter $executableName -File -Recurse -Depth $Depth -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($match) {
+            return $match.FullName
+        }
     }
 
     return $null
@@ -265,34 +350,40 @@ function Find-CodexExeUnder([string]$Root, [int]$Depth) {
 function Get-StoreCodexCandidates {
     $candidates = @()
 
-    $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\Codex.exe"
-    if (Test-Path -LiteralPath $alias -PathType Leaf) {
-        $candidates += (Resolve-Path -LiteralPath $alias).Path
-    }
+    foreach ($executableName in @("ChatGPT.exe", "Codex.exe")) {
+        $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\$executableName"
+        if (Test-Path -LiteralPath $alias -PathType Leaf) {
+            $candidates += (Resolve-Path -LiteralPath $alias).Path
+        }
 
-    $command = Get-Command Codex.exe -ErrorAction SilentlyContinue
-    if ($command -and $command.Source -and $command.Source -like "*\Microsoft\WindowsApps\*") {
-        $candidates += $command.Source
+        $command = Get-Command $executableName -ErrorAction SilentlyContinue
+        if ($command -and $command.Source -and $command.Source -like "*\Microsoft\WindowsApps\*") {
+            $candidates += $command.Source
+        }
     }
 
     if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
-        $packages = Get-AppxPackage -Name "*Codex*" -ErrorAction SilentlyContinue |
-            Where-Object { $_.InstallLocation }
-        foreach ($package in $packages) {
-            $exe = Find-CodexExeUnder $package.InstallLocation 4
-            if ($exe) {
-                $candidates += $exe
+        foreach ($packageName in @("*ChatGPT*", "*Codex*")) {
+            $packages = Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue |
+                Where-Object { $_.InstallLocation }
+            foreach ($package in $packages) {
+                $exe = Find-CodexExeUnder $package.InstallLocation 4
+                if ($exe) {
+                    $candidates += $exe
+                }
             }
         }
     }
 
     $windowsApps = Join-Path $env:ProgramFiles "WindowsApps"
     if (Test-Path -LiteralPath $windowsApps) {
-        $dirs = Get-ChildItem -LiteralPath $windowsApps -Directory -Filter "*Codex*" -ErrorAction SilentlyContinue
-        foreach ($dir in $dirs) {
-            $exe = Find-CodexExeUnder $dir.FullName 4
-            if ($exe) {
-                $candidates += $exe
+        foreach ($directoryName in @("*ChatGPT*", "*Codex*")) {
+            $dirs = Get-ChildItem -LiteralPath $windowsApps -Directory -Filter $directoryName -ErrorAction SilentlyContinue
+            foreach ($dir in $dirs) {
+                $exe = Find-CodexExeUnder $dir.FullName 4
+                if ($exe) {
+                    $candidates += $exe
+                }
             }
         }
     }
@@ -435,10 +526,11 @@ function Start-CodexWithProxyBypass {
     if (Test-WindowsAppsPath $script:CodexExecutable) {
         if ((Start-CodexViaAlias $script:CodexAliasExecutable $launchArgs) -or
             (Start-CodexViaAumid $script:CodexAumid $launchArgs) -or
+            (Start-CodexViaAlias $script:CodexAlternateAliasExecutable $launchArgs) -or
             (Start-CodexViaAlias (Split-Path -Leaf $script:CodexExecutable) $launchArgs)) {
             return
         }
-        Die "could not launch Codex Store app. Enable its app execution alias, or make sure Get-StartApps lists Codex so the script can resolve an AUMID."
+        Die "could not launch $script:TargetApp Store app. Enable its app execution alias, or make sure Get-StartApps lists ChatGPT or Codex so the script can resolve an AUMID."
         return
     }
 
@@ -454,10 +546,11 @@ function Start-CodexWithProxyBypass {
         if ((Test-WindowsAppsPath $script:CodexExecutable) -or $message -match "Access is denied|拒绝访问") {
             if ((Start-CodexViaAlias $script:CodexAliasExecutable $launchArgs) -or
                 (Start-CodexViaAumid $script:CodexAumid $launchArgs) -or
+                (Start-CodexViaAlias $script:CodexAlternateAliasExecutable $launchArgs) -or
                 (Start-CodexViaAlias (Split-Path -Leaf $script:CodexExecutable) $launchArgs)) {
                 return
             }
-            Die "could not launch Codex after direct Start-Process failed. Enable its app execution alias, or make sure Get-StartApps lists Codex so the script can resolve an AUMID."
+            Die "could not launch $script:TargetApp after direct Start-Process failed. Enable its app execution alias, or make sure Get-StartApps lists ChatGPT or Codex so the script can resolve an AUMID."
             return
         }
         throw
@@ -476,6 +569,11 @@ function Resolve-CodexApp {
     }
 
     $common = @(
+        (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\ChatGPT.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\ChatGPT\ChatGPT.exe"),
+        (Join-Path $env:LOCALAPPDATA "ChatGPT\ChatGPT.exe"),
+        (Join-Path $env:USERPROFILE "AppData\Local\Programs\ChatGPT\ChatGPT.exe"),
+        (Join-Path $env:ProgramFiles "ChatGPT\ChatGPT.exe"),
         (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\Codex.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Codex\Codex.exe"),
         (Join-Path $env:LOCALAPPDATA "Codex\Codex.exe"),
@@ -483,6 +581,7 @@ function Resolve-CodexApp {
         (Join-Path $env:ProgramFiles "Codex\Codex.exe")
     )
     if (${env:ProgramFiles(x86)}) {
+        $common += (Join-Path ${env:ProgramFiles(x86)} "ChatGPT\ChatGPT.exe")
         $common += (Join-Path ${env:ProgramFiles(x86)} "Codex\Codex.exe")
     }
 
@@ -501,39 +600,48 @@ function Resolve-CodexApp {
     }
 
     $roots = @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
-    foreach ($root in $roots) {
-        $match = Get-ChildItem -LiteralPath $root -Filter "Codex.exe" -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($match) {
-            Set-CodexExecutable $match.FullName
-            return
+    foreach ($executableName in @("ChatGPT.exe", "Codex.exe")) {
+        foreach ($root in $roots) {
+            $match = Get-ChildItem -LiteralPath $root -Filter $executableName -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($match) {
+                Set-CodexExecutable $match.FullName
+                return
+            }
         }
     }
 
-    Die "could not find Codex desktop app. Set codex_app_path in $ConfigFile"
+    Die "could not find ChatGPT or legacy Codex desktop app. Set codex_app_path in $ConfigFile"
 }
 
 function Ensure-CodexNotRunning {
-    Info "[1/5] Codex app: $script:CodexAppPath"
+    Info "[1/5] Target app: $script:CodexAppPath"
     if (-not [string]::IsNullOrWhiteSpace($script:CodexAliasExecutable)) {
         Info "      alias: $script:CodexAliasExecutable"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:CodexAlternateAliasExecutable)) {
+        Info "      alternate alias: $script:CodexAlternateAliasExecutable"
     }
     if (-not [string]::IsNullOrWhiteSpace($script:CodexAumid)) {
         Info "      AUMID: $script:CodexAumid"
     }
+    $normalizedTarget = Normalize-LocalPath $script:CodexExecutable
+    $normalizedPackageRoot = Normalize-LocalPath $script:CodexPackageInstallLocation
     $running = Get-CimInstance Win32_Process |
         Where-Object {
-            $_.ExecutablePath -eq $script:CodexExecutable -or
+            $processPath = Normalize-LocalPath $_.ExecutablePath
+            -not [string]::IsNullOrWhiteSpace($processPath) -and
             (
-                $_.Name -ieq "Codex.exe" -and
+                $processPath -ieq $normalizedTarget -or
                 (
-                    ($_.ExecutablePath -and $_.ExecutablePath -like "*\WindowsApps\*") -or
-                    ($_.CommandLine -and $_.CommandLine -match "(?i)codex")
+                    -not [string]::IsNullOrWhiteSpace($normalizedPackageRoot) -and
+                    ($processPath -ieq $normalizedPackageRoot -or
+                        $processPath.StartsWith($normalizedPackageRoot + "\", [StringComparison]::OrdinalIgnoreCase))
                 )
             )
         }
 
     if ($running) {
-        Write-Error "$script:TargetApp is already running. Quit Codex first, then run this script again."
+        Write-Error "$script:TargetApp is already running. Quit ChatGPT/Codex first, then run this script again."
         $running | ForEach-Object {
             Write-Host ("      {0} {1}" -f $_.ProcessId, $_.ExecutablePath)
         }

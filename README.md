@@ -5,6 +5,10 @@
 This directory is self-contained. Run commands from this directory after you
 clone or copy it.
 
+The current desktop app is named ChatGPT. The launchers also remain compatible
+with legacy Codex installations and intentionally keep stable Codex-named
+configuration and logging identifiers.
+
 macOS:
 
 ```bash
@@ -49,8 +53,11 @@ directory.
 
 Fields:
 
-- `codex_app_path`: leave empty to auto-detect Codex. Set it only when the
-  launcher cannot find the app.
+- `codex_app_path`: retained compatibility key for either a ChatGPT or legacy
+  Codex app/executable path. Leave it empty for auto-detection; set it only when
+  the launcher cannot find the app. On macOS it accepts either a `.app` bundle
+  (whose `CFBundleExecutable` is read from `Info.plist`) or a direct executable
+  path.
 - `model_source`: `catalog_json`, `api`, or `both`.
 - `catalog_json`: local model catalog path. Leave empty to auto-detect
   `models_catalog.json` next to `config.json`, then
@@ -65,12 +72,12 @@ Fields:
   response when the startup request hangs. Set `0` to keep mitmproxy's default
   TCP timeout. This is applied as mitmproxy's `tcp_timeout` for this helper
   process.
-- `enable_i18n`: enables Codex's UI localization layer in the AB initialize
-  response.
+- `enable_i18n`: enables the ChatGPT/Codex UI localization layer in the AB
+  initialize response.
 - `locale_source`: UI locale source for that layer. Supported values are
   `IDE`, `SYSTEM`, and `FIRST_AVAILABLE`. A specific manual language override
-  is stored by Codex as its local `localeOverride` setting, not directly in the
-  AB response.
+  is stored by the desktop app as its local `localeOverride` setting, not
+  directly in the AB response.
 - `desired_model`: model to inject and make the default.
 
 `host` and `path` are intentionally not configurable. The addon patches:
@@ -85,7 +92,7 @@ ab.chatgpt.com/v1/initialize
 The traffic path is:
 
 ```text
-Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
+ChatGPT/Codex --no-proxy-server -> mitmproxy local capture -> optional upstream_proxy
 ```
 
 When the startup request to `ab.chatgpt.com/v1/initialize` enters the addon,
@@ -102,17 +109,19 @@ request.
 
 On startup the launcher:
 
-1. Detects the Codex app path.
-2. Refuses to continue if Codex is already running.
+1. Detects the current ChatGPT app path, with legacy Codex fallback.
+2. Refuses to continue if the resolved target is already running.
 3. Installs `mitmdump` if missing.
 4. Creates and trusts the mitmproxy CA if needed.
 5. Stops any previous mitmdump capture using the same `rewrite.py`.
-6. Starts mitmproxy local capture for Codex process names.
-7. Launches Codex with system proxy variables cleared and Chromium proxy
-   bypass flags enabled.
+6. Starts mitmproxy local capture for the ChatGPT main process plus intentionally
+   retained Codex-named Chromium helpers and legacy Codex processes.
+7. Launches the resolved app with system proxy variables cleared and Chromium
+   proxy bypass flags enabled.
 
-When `upstream_proxy` is set, Codex is still launched without the system proxy,
-but mitmdump forwards captured outbound traffic through that proxy.
+When `upstream_proxy` is set, ChatGPT/Codex is still launched without the
+system proxy, but mitmdump forwards captured outbound traffic through that
+proxy.
 
 For the first run on a new machine, prefer starting with a working proxy path:
 enable your proxy client's TUN mode or set `upstream_proxy` in `config.json`.
@@ -121,10 +130,14 @@ snapshot before it ever needs the template fallback.
 
 ## Platform Notes
 
-- macOS requires the Mitmproxy Redirector network extension to be enabled.
+- macOS requires the Mitmproxy Redirector network extension to be enabled. The
+  current install is normally `/Applications/ChatGPT.app` with executable
+  `ChatGPT` and bundle ID `com.openai.codex`; its Chromium helpers remain
+  Codex-named. `Codex.app` remains an auto-detected fallback.
 - Linux should be run as the desktop user, not with `sudo`.
 - Windows Store installs are launched through the app execution alias or AUMID
-  when direct `WindowsApps` execution is blocked.
+  when direct `WindowsApps` execution is blocked. Both ChatGPT and Codex aliases,
+  package names, and executable names are recognized.
 
 ## Recommended Companion
 
@@ -133,10 +146,10 @@ This project is recommended to use together with
 
 ## Logs
 
-The foreground output is intentionally short. On macOS and Linux, Codex stderr
-and mitmproxy core logs are written to local log files, and only addon lines
-containing `[codex-patch]` are echoed to the terminal. Windows writes mitmdump
-output and direct Codex launch output under
+The foreground output is intentionally short. On macOS and Linux, target app
+stderr and mitmproxy core logs are written to local log files, and only addon
+lines containing `[codex-patch]` are echoed to the terminal. Windows writes
+mitmdump output and direct ChatGPT/Codex launch output under
 `%LOCALAPPDATA%\CodexModelBridge\Logs`.
 
 Log locations:
@@ -156,5 +169,6 @@ Useful addon lines look like:
 [codex-patch] Models response patched: ...
 ```
 
-After changing `rewrite.py` or `config.json`, quit Codex and restart the
-launcher. The mitmproxy addon is loaded at startup.
+After changing `rewrite.py` or `config.json`, fully quit ChatGPT/Codex, including
+any remaining background process, and restart the launcher. The mitmproxy addon
+is loaded at startup.

@@ -1,19 +1,19 @@
 #!/bin/bash
-# start-macos.sh - Single-run mitmdump proxy helper for Codex.
+# start-macos.sh - Single-run mitmdump proxy helper for ChatGPT and legacy Codex.
 #
 # This script has no command-line arguments. Local differences live in config:
-#   - Target app: config codex_app_path, then auto-detected Codex.app
+#   - Target app: config codex_app_path, then auto-detected ChatGPT.app or Codex.app
 #   - Config path: config.json next to this script
 #   - Install method: auto (brew -> uv -> pipx -> pip-user)
 #   - CA path: ~/.mitmproxy/mitmproxy-ca-cert.pem
-#   - Local capture: mitmproxy local mode for Codex process names
+#   - Local capture: mitmproxy local mode for ChatGPT and Codex process names
 #
 # On each run it:
-#   1. Resolves the Codex app path and ensures Codex is not already running
+#   1. Resolves the target app path and ensures it is not already running
 #   2. Ensures mitmdump is available (auto-installs if missing)
 #   3. Ensures mitmproxy CA exists and is trusted system-wide
 #   4. Ensures the mitmproxy local redirector extension is enabled
-#   5. Starts mitmdump local capture and launches Codex with system proxy bypassed
+#   5. Starts mitmdump local capture and launches the target with system proxy bypassed
 #
 # See README.md for full documentation.
 
@@ -23,10 +23,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWRITE_SCRIPT="$SCRIPT_DIR/rewrite.py"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 
-TARGET_APP="Codex.app"
+TARGET_APP="ChatGPT.app"
 CODEX_APP_PATH=""
 CODEX_EXECUTABLE=""
-MITM_LOCAL_SPEC="Codex (Service),Codex,codex"
+MITM_LOCAL_SPEC="ChatGPT,chatgpt,Codex (Service),Codex,codex"
 NO_PROXY_LIST="*"
 PROXY_BYPASS_LIST="*"
 CA_DIR="${HOME}/.mitmproxy"
@@ -79,17 +79,26 @@ config_value() {
 
 expand_path() {
     local path="$1"
-    if [[ "$path" == "~/"* ]]; then
+    if [[ "$path" == "~" ]]; then
+        path="$HOME"
+    elif [[ "$path" == "~/"* ]]; then
         path="${HOME}/${path#~/}"
+    elif [[ "$path" != /* ]]; then
+        path="${SCRIPT_DIR}/${path}"
     fi
     printf '%s\n' "$path"
 }
 
 executable_from_app_path() {
-    local path
+    local path executable_name
     path="$(expand_path "$1")"
     if [[ "$path" == *.app ]]; then
-        printf '%s/Contents/MacOS/Codex\n' "$path"
+        executable_name="$(
+            plutil -extract CFBundleExecutable raw -o - \
+                "$path/Contents/Info.plist" 2>/dev/null || true
+        )"
+        [ -n "$executable_name" ] || return 0
+        printf '%s/Contents/MacOS/%s\n' "$path" "$executable_name"
     else
         printf '%s\n' "$path"
     fi
@@ -132,19 +141,26 @@ resolve_codex_app() {
         fi
     done < <(
         {
-            find /Applications "$HOME/Applications" -maxdepth 1 -name 'Codex.app' -type d -print 2>/dev/null || true
+            printf '%s\n' \
+                "/Applications/ChatGPT.app" \
+                "$HOME/Applications/ChatGPT.app"
+            mdfind 'kMDItemFSName == "ChatGPT.app"' 2>/dev/null || true
+            printf '%s\n' \
+                "/Applications/Codex.app" \
+                "$HOME/Applications/Codex.app"
             mdfind 'kMDItemFSName == "Codex.app"' 2>/dev/null || true
+            mdfind 'kMDItemCFBundleIdentifier == "com.openai.codex"' 2>/dev/null || true
         } | awk '!seen[$0]++'
     )
 
-    die "could not find Codex.app. Set codex_app_path in $CONFIG_FILE"
+    die "could not find ChatGPT.app or legacy Codex.app. Set codex_app_path in $CONFIG_FILE"
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: Ensure Codex startup state
+# Step 1: Ensure target app startup state
 # ---------------------------------------------------------------------------
 ensure_codex_not_running() {
-    info "[1/5] Codex app: $CODEX_APP_PATH"
+    info "[1/5] Target app: $CODEX_APP_PATH"
 
     local process_lines
     process_lines="$(
@@ -156,7 +172,7 @@ ensure_codex_not_running() {
     )"
     if [ -n "$process_lines" ]; then
         echo "Error: ${TARGET_APP} is already running." >&2
-        echo "Quit Codex first, then run this script again." >&2
+        echo "Quit ${TARGET_APP} first, then run this script again." >&2
         echo "Current matching processes:" >&2
         echo "$process_lines" | sed 's/^/      /' >&2
         exit 1

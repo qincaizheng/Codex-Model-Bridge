@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# start-linux.sh - Single-run mitmdump local capture helper for Codex.
+# start-linux.sh - Single-run mitmdump local capture helper for ChatGPT and legacy Codex.
 
 set -euo pipefail
 
@@ -7,11 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWRITE_SCRIPT="$SCRIPT_DIR/rewrite.py"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 
-TARGET_APP="Codex"
+TARGET_APP="ChatGPT"
 CODEX_APP_PATH=""
 CODEX_EXECUTABLE=""
 MITMDUMP_CMD=""
-MITM_LOCAL_SPEC="Codex,codex"
+MITM_LOCAL_SPEC="ChatGPT,chatgpt,Codex,codex"
 NO_PROXY_LIST="*"
 PROXY_BYPASS_LIST="*"
 CA_DIR="${HOME}/.mitmproxy"
@@ -64,8 +64,12 @@ config_value() {
 
 expand_path() {
     local path="$1"
-    if [[ "$path" == "~/"* ]]; then
+    if [[ "$path" == "~" ]]; then
+        path="$HOME"
+    elif [[ "$path" == "~/"* ]]; then
         path="${HOME}/${path#~/}"
+    elif [[ "$path" != /* ]]; then
+        path="${SCRIPT_DIR}/${path}"
     fi
     printf '%s\n' "$path"
 }
@@ -95,34 +99,46 @@ resolve_codex_app() {
     done < <(
         {
             printf '%s\n' \
+                "/opt/ChatGPT/chatgpt" \
+                "/opt/ChatGPT/ChatGPT" \
+                "/opt/chatgpt/chatgpt" \
+                "/usr/local/bin/chatgpt-desktop" \
+                "/usr/bin/chatgpt-desktop" \
+                "$HOME/.local/bin/chatgpt-desktop" \
+                "/usr/local/bin/chatgpt" \
+                "/usr/bin/chatgpt" \
+                "$HOME/.local/bin/chatgpt" \
                 "/opt/Codex/codex" \
                 "/opt/Codex/Codex" \
                 "/usr/local/bin/codex-desktop" \
                 "/usr/bin/codex-desktop" \
                 "$HOME/.local/bin/codex-desktop"
             find "$HOME/Applications" "$HOME/Downloads" /opt -maxdepth 3 \
-                \( -iname 'Codex*.AppImage' -o -path '*/Codex/codex' -o -path '*/Codex/Codex' \) \
+                \( -iname 'ChatGPT*.AppImage' -o -iname 'chatgpt*.AppImage' \
+                    -o -path '*/ChatGPT/chatgpt' -o -path '*/ChatGPT/ChatGPT' -o -path '*/chatgpt/chatgpt' \
+                    -o -iname 'Codex*.AppImage' -o -path '*/Codex/codex' -o -path '*/Codex/Codex' \) \
                 -type f -perm -111 -print 2>/dev/null || true
         } | awk '!seen[$0]++'
     )
 
-    die "could not find Codex desktop app. Set codex_app_path in $CONFIG_FILE"
+    die "could not find ChatGPT or legacy Codex desktop app. Set codex_app_path in $CONFIG_FILE"
 }
 
 ensure_codex_not_running() {
-    info "[1/5] Codex app: $CODEX_APP_PATH"
+    info "[1/5] Target app: $CODEX_APP_PATH"
 
-    local process_lines
+    local process_lines proc_exe pid
     process_lines="$(
-        ps axww -o pid=,args= | awk -v expected="$CODEX_EXECUTABLE" '
-            index($0, expected) {
-                print
-            }
-        '
+        for proc_exe in /proc/[0-9]*/exe; do
+            [ "$proc_exe" -ef "$CODEX_EXECUTABLE" ] 2>/dev/null || continue
+            pid="${proc_exe#/proc/}"
+            pid="${pid%/exe}"
+            ps -p "$pid" -o pid=,args= 2>/dev/null || true
+        done
     )"
     if [ -n "$process_lines" ]; then
         echo "Error: ${TARGET_APP} is already running." >&2
-        echo "Quit Codex first, then run this script again." >&2
+        echo "Quit ${TARGET_APP} first, then run this script again." >&2
         echo "Current matching processes:" >&2
         echo "$process_lines" | sed 's/^/      /' >&2
         exit 1
