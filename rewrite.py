@@ -3,17 +3,21 @@
 The network targets are intentionally hardcoded:
 
 - Statsig startup config: ab.chatgpt.com/v1/initialize
-- Provider model source: any Codex-captured request whose path ends in /models
+- Post-login Statsig config: chatgpt.com/wham/statsig/bootstrap
+- Model API source: any Codex-captured request whose path ends in /models
 
 Only local machine differences live in config.json: desired_model and where to
-read model rows from. A model source can be a local catalog JSON file or a
-configured OpenAI-compatible base URL plus API key. Statsig is only used to keep
-those rows visible and choose the default model.
+read model rows from. A bundled, sanitized catalog template is included next to
+this script so a fresh installation can still enrich API model rows. A
+model source can be a local catalog JSON file or a configured OpenAI-compatible
+base URL plus API key. Statsig is only used to keep those rows visible and
+choose the default model.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import time
@@ -28,6 +32,8 @@ from mitmproxy import ctx, http
 
 STATSIG_HOST = "ab.chatgpt.com"
 STATSIG_PATH_PREFIX = "/v1/initialize"
+WHAM_STATSIG_HOSTS = ("chatgpt.com", "chat.openai.com")
+WHAM_STATSIG_PATH = "/wham/statsig/bootstrap"
 STATSIG_DYNAMIC_CONFIG_KEYS = ("107580212", "2523198654")
 STATSIG_I18N_LAYER_CONFIG_KEY = "72216192"
 STATSIG_LOCALE_SOURCE_VALUES = ("IDE", "SYSTEM", "FIRST_AVAILABLE")
@@ -38,8 +44,31 @@ DEFAULT_UPSTREAM_PROXY = ""
 DEFAULT_AB_FALLBACK_TIMEOUT_SECONDS = 8
 DEFAULT_ENABLE_I18N = True
 DEFAULT_LOCALE_SOURCE = "FIRST_AVAILABLE"
+# Avoid WAF rules that reject urllib's default Python browser signature.
+MODEL_API_USER_AGENT = "CodexModelBridge/1.0"
+DEFAULT_INPUT_MODALITIES = ("text",)
+SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "audio"})
 
 STALE_HEADERS = ("content-length", "etag", "last-modified", "content-md5")
+MODEL_INTERNAL_KEYS = frozenset({"_source_fields"})
+MODEL_SOURCE_ONLY_KEYS = frozenset(
+    {
+        "id",
+        "object",
+        "created",
+        "owned_by",
+        "name",
+        "provider",
+    }
+)
+NATIVE_MODEL_SIGNATURE_KEYS = (
+    "slug",
+    "display_name",
+    "supported_reasoning_levels",
+    "shell_type",
+    "visibility",
+    "base_instructions",
+)
 FALLBACK_RESPONSE_HEADERS = {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -80,6 +109,11 @@ def _statsig_init_template_path() -> str:
 
 
 DEFAULT_CATALOG_JSON = ""
+BUNDLED_CATALOG_FILENAME = "models_catalog.template.json"
+RUNTIME_BUNDLED_CATALOG_ENV = "CODEX_MODEL_BRIDGE_BUNDLED_CATALOG"
+RUNTIME_CATALOG_ENV = "CODEX_MODEL_BRIDGE_RUNTIME_CATALOG"
+RUNTIME_CATALOG_META_ENV = "CODEX_MODEL_BRIDGE_RUNTIME_META"
+RUNTIME_GENERATION_ENV = "CODEX_MODEL_BRIDGE_RUNTIME_GENERATION"
 
 
 def _resolve_config_path(value: str) -> str:
@@ -90,11 +124,11 @@ def _resolve_config_path(value: str) -> str:
 
 
 def _default_catalog_candidates() -> tuple[str, ...]:
-    home = os.path.expanduser("~")
-    return (
+    candidates = (
         os.path.join(os.path.dirname(_config_path()), "models_catalog.json"),
-        os.path.join(home, ".codex", "models_catalog.json"),
+        os.path.join(_script_dir(), BUNDLED_CATALOG_FILENAME),
     )
+    return tuple(dict.fromkeys(candidates))
 
 
 def _find_default_catalog_path() -> str:
@@ -178,6 +212,15 @@ def _is_statsig_initialize(request) -> bool:
     )
 
 
+def _is_wham_statsig_bootstrap(request) -> bool:
+    path = _request_path(request).rstrip("/")
+    return (
+        request.method.upper() == "POST"
+        and any(_request_matches_host(request, host) for host in WHAM_STATSIG_HOSTS)
+        and path.endswith(WHAM_STATSIG_PATH)
+    )
+
+
 def _is_models_response_candidate(request) -> bool:
     path = _request_path(request).rstrip("/")
     return request.method.upper() == "GET" and path.endswith("/models")
@@ -225,32 +268,204 @@ def _encode_se(body: dict[str, Any]) -> str:
 def _model_id(model: Any) -> str | None:
     if not isinstance(model, dict):
         return None
-    value = model.get("id") or model.get("slug") or model.get("name")
+    value = model.get("slug") or model.get("id") or model.get("name")
     return value if isinstance(value, str) and value else None
 
 
+def _model_display_name(model: dict[str, Any], slug: str) -> str:
+    for key in ("display_name", "name"):
+        value = model.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return slug
+
+
+def _model_source_fields(model: dict[str, Any]) -> set[str]:
+    fields = model.get("_source_fields")
+    if isinstance(fields, (list, tuple, set, frozenset)):
+        return {field for field in fields if isinstance(field, str)}
+    return {key for key in model if key not in MODEL_INTERNAL_KEYS}
+
+
+def _synchronize_reasoning_summary_fields(model: dict[str, Any]) -> None:
+    """Keep the legacy and current catalog field names semantically aligned."""
+    current = model.get("supports_reasoning_summary_parameter")
+    legacy = model.get("supports_reasoning_summaries")
+
+    if isinstance(current, bool):
+        # The current Codex schema is authoritative when both names exist.
+        model["supports_reasoning_summaries"] = current
+    elif isinstance(legacy, bool):
+        model["supports_reasoning_summary_parameter"] = legacy
+
+
+def _input_modalities_or_default(model: dict[str, Any]) -> list[str]:
+    modalities = model.get("input_modalities")
+    if isinstance(modalities, list):
+        normalized: list[str] = []
+        for item in modalities:
+            if (
+                isinstance(item, str)
+                and item in SUPPORTED_INPUT_MODALITIES
+                and item not in normalized
+            ):
+                normalized.append(item)
+        if normalized:
+            return normalized
+    return list(DEFAULT_INPUT_MODALITIES)
+
+
+def _looks_like_openai_model(model: Any) -> bool:
+    if not isinstance(model, dict):
+        return False
+    model_id = model.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        return False
+    return any(key in model for key in ("object", "created", "owned_by"))
+
+
+def _looks_like_native_model(model: Any) -> bool:
+    if not isinstance(model, dict):
+        return False
+    if not all(key in model for key in NATIVE_MODEL_SIGNATURE_KEYS):
+        return False
+    return (
+        isinstance(model.get("slug"), str)
+        and bool(model["slug"])
+        and isinstance(model.get("display_name"), str)
+        and isinstance(model.get("supported_reasoning_levels"), list)
+        and isinstance(model.get("shell_type"), str)
+        and isinstance(model.get("visibility"), str)
+        and isinstance(model.get("base_instructions"), str)
+    )
+
+
+def _default_native_model(slug: str, display_name: str) -> dict[str, Any]:
+    return {
+        "slug": slug,
+        "display_name": display_name,
+        "description": None,
+        "default_reasoning_level": None,
+        "supported_reasoning_levels": [],
+        "shell_type": "default",
+        "visibility": "list",
+        "minimal_client_version": [0, 0, 0],
+        "supported_in_api": True,
+        "priority": 99,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "default_service_tier": None,
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "You are Codex, a coding agent.",
+        "model_messages": None,
+        "include_skills_usage_instructions": False,
+        "supports_reasoning_summary_parameter": True,
+        # Older catalogs used this field name; keep both defaults aligned.
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "bytes", "limit": 10_000},
+        "supports_parallel_tool_calls": False,
+        "supports_image_detail_original": False,
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "auto_compact_token_limit": None,
+        "comp_hash": None,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": list(DEFAULT_INPUT_MODALITIES),
+        "supports_search_tool": False,
+        "use_responses_lite": False,
+        "auto_review_model_override": None,
+        "tool_mode": None,
+        "multi_agent_version": None,
+    }
+
+
 def _openai_model_from_catalog(model: dict[str, Any]) -> dict[str, Any]:
-    slug = model.get("slug") or model.get("id")
-    if isinstance(model.get("id"), str):
-        row = deepcopy(model)
-        row.setdefault("object", "model")
-        row.setdefault("created", 0)
-        row.setdefault("owned_by", "openai")
-        return row
+    slug = _model_id(model)
+    if slug is None:
+        return {}
+
+    object_name = model.get("object")
+    if not isinstance(object_name, str) or not object_name:
+        object_name = "model"
+
+    created = model.get("created")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        created = 0
+    else:
+        created = int(created)
+
+    owned_by = model.get("owned_by") or model.get("provider")
+    if not isinstance(owned_by, str) or not owned_by:
+        owned_by = "openai"
+
     row = {
         "id": slug,
-        "object": "model",
-        "created": 0,
-        "owned_by": "openai",
+        "object": object_name,
+        "created": created,
+        "owned_by": owned_by,
     }
-    display_name = model.get("display_name")
-    if isinstance(display_name, str):
+
+    display_name = _model_display_name(model, slug)
+    if display_name != slug:
         row["display_name"] = display_name
     return row
 
 
 def _models_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/models"
+
+
+def _http_error_summary(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+
+    if not isinstance(payload, dict):
+        return ""
+
+    details: dict[str, Any] = {}
+    error = payload.get("error")
+    if isinstance(error, dict):
+        for key in ("message", "type", "code"):
+            if key not in error:
+                continue
+            value = error[key]
+            if isinstance(value, str):
+                details[key] = value[:500]
+            elif isinstance(value, (int, float, bool)) or value is None:
+                details[key] = value
+    else:
+        for key in (
+            "title",
+            "detail",
+            "error_code",
+            "error_name",
+            "retryable",
+            "cloudflare_error",
+        ):
+            if key not in payload:
+                continue
+            value = payload[key]
+            if isinstance(value, str):
+                details[key] = value[:500]
+            elif isinstance(value, (int, float, bool)) or value is None:
+                details[key] = value
+
+    if not details:
+        return ""
+    return " response=" + json.dumps(
+        details,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _parse_upstream_proxy(value: str) -> tuple[str, tuple[str, int]] | None:
@@ -321,14 +536,31 @@ class CodexCatalogPatcher:
         self.enable_i18n = DEFAULT_ENABLE_I18N
         self.locale_source = DEFAULT_LOCALE_SOURCE
         self.upstream_via: tuple[str, tuple[str, int]] | None = None
+        self.runtime_bundled_catalog_path = os.environ.get(
+            RUNTIME_BUNDLED_CATALOG_ENV,
+            "",
+        )
+        self.runtime_catalog_path = os.environ.get(RUNTIME_CATALOG_ENV, "")
+        self.runtime_catalog_meta_path = os.environ.get(
+            RUNTIME_CATALOG_META_ENV,
+            "",
+        )
+        self.runtime_generation = os.environ.get(RUNTIME_GENERATION_ENV, "")
+        self.api_models_fetch_succeeded = False
+        self.api_model_ids: set[str] = set()
+        self.runtime_bundled_models: list[dict[str, Any]] = []
+        self.metadata_models: list[dict[str, Any]] = []
+        self.metadata_slugs: list[str] = []
         self.catalog_models: list[dict[str, Any]] = []
         self.catalog_slugs: list[str] = []
+        self.catalog_by_slug: dict[str, dict[str, Any]] = {}
         self._snapshot_dir_ensured = False
 
     def load(self, loader) -> None:
         self._load_config()
         self._apply_runtime_options()
         self._load_model_sources()
+        self._write_runtime_catalog_if_requested()
 
     def _apply_upstream_proxy(self, server) -> None:
         if not self.upstream_via:
@@ -356,17 +588,26 @@ class CodexCatalogPatcher:
     def tls_established_client(self, data) -> None:
         if not _context_matches_host(data.context, STATSIG_HOST):
             return
-        _log("error", f"[codex-patch] AB TLS client established: hosts={_context_hosts(data.context)}")
+        _log(
+            "error",
+            f"[codex-patch] AB TLS client established: hosts={_context_hosts(data.context)}",
+        )
 
     def tls_failed_client(self, data) -> None:
         if not _context_matches_host(data.context, STATSIG_HOST):
             return
-        _log("error", f"[codex-patch] AB TLS client failed: hosts={_context_hosts(data.context)}")
+        _log(
+            "error",
+            f"[codex-patch] AB TLS client failed: hosts={_context_hosts(data.context)}",
+        )
 
     def tls_failed_server(self, data) -> None:
         if not _context_matches_host(data.context, STATSIG_HOST):
             return
-        _log("error", f"[codex-patch] AB TLS server failed: hosts={_context_hosts(data.context)}")
+        _log(
+            "error",
+            f"[codex-patch] AB TLS server failed: hosts={_context_hosts(data.context)}",
+        )
 
     def requestheaders(self, flow) -> None:
         self._apply_upstream_proxy(flow.server_conn)
@@ -398,7 +639,9 @@ class CodexCatalogPatcher:
         for key in REQUEST_DELTA_KEYS:
             body.pop(key, None)
 
-        request.set_text(_encode_se(body) if encoded else json.dumps(body, ensure_ascii=False))
+        request.set_text(
+            _encode_se(body) if encoded else json.dumps(body, ensure_ascii=False)
+        )
         _remove_stale_headers(request.headers)
         _log(
             "error",
@@ -412,6 +655,10 @@ class CodexCatalogPatcher:
         response = flow.response
         if _is_statsig_initialize(request):
             self._patch_statsig_response(flow, response)
+            return
+
+        if _is_wham_statsig_bootstrap(request):
+            self._patch_wham_statsig_response(request, response)
             return
 
         if _is_models_response_candidate(request):
@@ -436,7 +683,7 @@ class CodexCatalogPatcher:
             _log("warn", f"[codex-patch] Config not found at {path}; using defaults")
         except (OSError, json.JSONDecodeError) as exc:
             config = {}
-            _log("error", f"[codex-patch] Failed to load config {path}: {exc}")
+            _log("warn", f"[codex-patch] Failed to load config {path}: {exc}")
 
         model_source = config.get("model_source", DEFAULT_MODEL_SOURCE)
         desired_model = config.get("desired_model", DEFAULT_DESIRED_MODEL)
@@ -474,7 +721,7 @@ class CodexCatalogPatcher:
                 self.locale_source = normalized_locale_source
             else:
                 _log(
-                    "error",
+                    "warn",
                     "[codex-patch] Invalid locale_source="
                     f"{locale_source}; using {DEFAULT_LOCALE_SOURCE}",
                 )
@@ -484,7 +731,7 @@ class CodexCatalogPatcher:
                 self.upstream_via = _parse_upstream_proxy(self.upstream_proxy)
             except ValueError as exc:
                 self.upstream_via = None
-                _log("error", f"[codex-patch] Invalid upstream_proxy: {exc}")
+                _log("warn", f"[codex-patch] Invalid upstream_proxy: {exc}")
 
         _log(
             "info",
@@ -503,51 +750,133 @@ class CodexCatalogPatcher:
         if options is None or not hasattr(options, "update"):
             return
 
-        updates: dict[str, Any] = {"connection_strategy": "lazy"}
-        if self.ab_fallback_timeout_seconds > 0:
-            updates["tcp_timeout"] = self.ab_fallback_timeout_seconds
-        options.update(**updates)
+        # The AB fallback timeout belongs only to the explicit urllib request in
+        # _resolve_statsig_request. Applying it as mitmproxy's global TCP idle
+        # timeout would terminate quiet long-running Responses API streams.
+        options.update(connection_strategy="lazy")
 
     def _load_model_sources(self) -> None:
         models: list[dict[str, Any]] = []
         source = self.model_source.lower()
+        catalog_models = self._load_catalog_models()
+        self.runtime_bundled_models = self._load_runtime_bundled_models()
+        bundled_template_models = self._load_bundled_template_models()
+        bundled_template_path = os.path.abspath(
+            os.path.join(_script_dir(), BUNDLED_CATALOG_FILENAME)
+        )
+        if os.path.abspath(self.catalog_path) == bundled_template_path:
+            metadata_sources = catalog_models + self.runtime_bundled_models
+        else:
+            metadata_sources = (
+                catalog_models
+                + bundled_template_models
+                + self.runtime_bundled_models
+            )
+        metadata_models, metadata_slugs = self._dedupe_models(
+            metadata_sources
+        )
+        self.metadata_models = metadata_models
+        self.metadata_slugs = metadata_slugs
 
         if source in ("catalog_json", "both"):
-            models.extend(self._load_catalog_models())
+            models.extend(catalog_models)
         if source in ("api", "both"):
-            models.extend(self._load_api_models())
+            api_models = self._load_api_models()
+            self.api_model_ids = {
+                slug
+                for slug in (_model_id(model) for model in api_models)
+                if slug is not None
+            }
+            if api_models:
+                models.extend(
+                    self._enrich_model_metadata(api_models, metadata_models)
+                )
+            elif source == "api":
+                models.extend(self._load_previous_runtime_models())
+        else:
+            self.api_model_ids = set()
         if source not in ("catalog_json", "api", "both"):
             _log(
-                "error",
+                "warn",
                 f"[codex-patch] Unknown model_source={self.model_source}; "
                 "falling back to catalog_json",
             )
-            models.extend(self._load_catalog_models())
+            models.extend(catalog_models)
 
         clean_models, slugs = self._dedupe_models(models)
         if self.desired_model not in slugs:
-            clean_models.append(
-                {
-                    "slug": self.desired_model,
-                    "id": self.desired_model,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "openai",
-                }
+            desired_aliases = {
+                self.desired_model,
+                self.desired_model.rsplit("/", 1)[-1],
+            }
+            alias_matches: list[str] = []
+            for model in clean_models:
+                slug = _model_id(model)
+                if slug is None:
+                    continue
+                if desired_aliases.intersection(self._model_aliases(model)):
+                    alias_matches.append(slug)
+            if len(alias_matches) == 1:
+                configured_model = self.desired_model
+                self.desired_model = alias_matches[0]
+                _log(
+                    "info",
+                    "[codex-patch] Resolved desired_model alias "
+                    f"{configured_model} -> {self.desired_model}",
+                )
+
+        if self.desired_model not in slugs and source == "api":
+            if clean_models:
+                configured_model = self.desired_model
+                self.desired_model = slugs[0]
+                _log(
+                    "warn",
+                    f"[codex-patch] desired_model={configured_model} is not "
+                    f"returned by the model API; using {self.desired_model} "
+                    "as the runtime default without injecting an extra "
+                    "catalog row",
+                )
+            else:
+                _log(
+                    "warn",
+                    "[codex-patch] No API or previous runtime model IDs are "
+                    "available; refusing to populate the runtime catalog "
+                    "from metadata templates",
+                )
+        elif self.desired_model not in slugs:
+            desired_rows = self._normalize_model_rows(
+                [
+                    {
+                        "slug": self.desired_model,
+                        "name": self.desired_model.rsplit("/", 1)[-1],
+                    }
+                ]
             )
+            desired_models = self._enrich_model_metadata(
+                desired_rows,
+                metadata_models,
+                log_result=False,
+            )
+            clean_models.extend(desired_models)
             slugs.append(self.desired_model)
             _log(
                 "warn",
                 f"[codex-patch] desired_model={self.desired_model} is not in "
-                "loaded models; using a minimal model row",
+                "loaded models; injecting a catalog-backed fallback row",
             )
         self.catalog_models = clean_models
         self.catalog_slugs = slugs
+        self.catalog_by_slug = {
+            model["slug"]: model
+            for model in clean_models
+            if isinstance(model.get("slug"), str)
+        }
 
         _log(
             "info",
             f"[codex-patch] Loaded {len(self.catalog_slugs)} model(s) from "
-            f"source={self.model_source}",
+            f"source={self.model_source}; "
+            f"metadata_templates={len(self.metadata_slugs)}",
         )
 
     def _resolve_statsig_request(self, flow) -> None:
@@ -599,55 +928,273 @@ class CodexCatalogPatcher:
         )
 
     def _load_catalog_models(self) -> list[dict[str, Any]]:
+        return self._load_catalog_models_from_path(self.catalog_path, "local catalog")
+
+    def _load_bundled_template_models(self) -> list[dict[str, Any]]:
+        path = os.path.join(_script_dir(), BUNDLED_CATALOG_FILENAME)
+        if os.path.abspath(path) == os.path.abspath(self.catalog_path):
+            return []
+        return self._load_catalog_models_from_path(path, "bundled metadata template")
+
+    def _load_catalog_models_from_path(
+        self,
+        path: str,
+        label: str,
+    ) -> list[dict[str, Any]]:
         try:
-            with open(self.catalog_path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 catalog = json.load(f)
         except FileNotFoundError:
-            _log("warn", f"[codex-patch] Catalog not found: {self.catalog_path}")
+            _log("warn", f"[codex-patch] Catalog not found: {path}")
             return []
         except (OSError, json.JSONDecodeError) as exc:
-            _log("error", f"[codex-patch] Failed to load catalog {self.catalog_path}: {exc}")
+            _log(
+                "warn",
+                f"[codex-patch] Failed to load catalog {path}: {exc}",
+            )
             return []
 
         models = catalog.get("models") if isinstance(catalog, dict) else catalog
         if not isinstance(models, list):
-            _log("error", f"[codex-patch] Catalog has no model list: {self.catalog_path}")
+            _log("warn", f"[codex-patch] Catalog has no model list: {path}")
             return []
 
-        _log("info", f"[codex-patch] Read local catalog: {self.catalog_path}")
+        _log("info", f"[codex-patch] Read {label}: {path}")
         return self._normalize_model_rows(models)
 
     def _load_api_models(self) -> list[dict[str, Any]]:
+        self.api_models_fetch_succeeded = False
         if not self.api_base_url:
-            _log("error", "[codex-patch] model_source=api but api_base_url is empty")
+            _log("warn", "[codex-patch] model_source=api but api_base_url is empty")
             return []
 
         url = _models_url(self.api_base_url)
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": MODEL_API_USER_AGENT,
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with self._url_opener().open(request, timeout=10) as response:
                 raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            summary = _http_error_summary(exc.read(4096))
+            _log(
+                "warn",
+                f"[codex-patch] Failed to fetch API models from {url}: "
+                f"HTTP {exc.code} {exc.reason}{summary}",
+            )
+            return []
         except (OSError, urllib.error.URLError) as exc:
-            _log("error", f"[codex-patch] Failed to fetch API models from {url}: {exc}")
+            _log("warn", f"[codex-patch] Failed to fetch API models from {url}: {exc}")
             return []
 
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
-            _log("error", f"[codex-patch] API models response is not JSON: {exc}")
+            _log("warn", f"[codex-patch] API models response is not JSON: {exc}")
             return []
 
         if isinstance(payload, dict) and "error" in payload:
-            _log("error", f"[codex-patch] API models endpoint returned error from {url}")
+            _log("warn", f"[codex-patch] API models endpoint returned error from {url}")
             return []
 
         rows = self._extract_model_rows(payload)
-        _log("info", f"[codex-patch] Fetched {len(rows)} API model row(s) from {url}")
-        return self._normalize_model_rows(rows)
+        normalized = self._normalize_model_rows(rows)
+        unique_models, unique_ids = self._dedupe_models(normalized)
+        self.api_models_fetch_succeeded = bool(unique_models)
+        if not unique_models:
+            _log(
+                "warn",
+                f"[codex-patch] API models endpoint returned no model rows: {url}",
+            )
+        _log(
+            "info",
+            f"[codex-patch] Fetched {len(rows)} API model row(s), "
+            f"{len(unique_ids)} unique model ID(s) from {url}",
+        )
+        return unique_models
+
+    def _load_runtime_bundled_models(self) -> list[dict[str, Any]]:
+        path = self.runtime_bundled_catalog_path
+        if not path:
+            return []
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                catalog = json.load(f)
+        except FileNotFoundError:
+            _log("warn", f"[codex-patch] Bundled runtime catalog not found: {path}")
+            return []
+        except (OSError, json.JSONDecodeError) as exc:
+            _log(
+                "warn",
+                f"[codex-patch] Failed to load bundled runtime catalog {path}: {exc}",
+            )
+            return []
+
+        rows = self._extract_model_rows(catalog)
+        models = [
+            deepcopy(row)
+            for row in rows
+            if isinstance(row, dict) and _looks_like_native_model(row)
+        ]
+        _log(
+            "info",
+            f"[codex-patch] Read {len(models)} bundled runtime model(s): {path}",
+        )
+        return models
+
+    @staticmethod
+    def _runtime_native_model(model: dict[str, Any]) -> dict[str, Any]:
+        row = deepcopy(model)
+        for key in MODEL_INTERNAL_KEYS | MODEL_SOURCE_ONLY_KEYS:
+            row.pop(key, None)
+
+        slug = _model_id(row)
+        if slug is None:
+            return {}
+
+        display_name = _model_display_name(row, slug)
+        defaults = _default_native_model(slug, display_name)
+        for key, value in defaults.items():
+            row.setdefault(key, deepcopy(value))
+        _synchronize_reasoning_summary_fields(row)
+        row.pop("supports_reasoning_summaries", None)
+        row["slug"] = slug
+        row["display_name"] = display_name
+        row["input_modalities"] = _input_modalities_or_default(row)
+        return row
+
+    def _runtime_catalog_models(self) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        source = self.model_source.lower()
+        if source in ("api", "both") and not self.api_models_fetch_succeeded:
+            for model in self._load_previous_runtime_models():
+                slug = _model_id(model)
+                if slug is None or slug in seen:
+                    continue
+                result.append(deepcopy(model))
+                seen.add(slug)
+
+        for model in self.catalog_models:
+            slug = _model_id(model)
+            if slug is None or slug in seen:
+                continue
+            row = self._runtime_native_model(model)
+            if not row:
+                continue
+            row["visibility"] = "list"
+            row["supported_in_api"] = True
+            result.append(row)
+            seen.add(slug)
+
+        return result
+
+    def _load_previous_runtime_models(self) -> list[dict[str, Any]]:
+        path = self.runtime_catalog_path
+        if not path:
+            return []
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                catalog = json.load(f)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return []
+
+        rows = self._extract_model_rows(catalog)
+        models, _ = self._dedupe_models(
+            [
+                deepcopy(row)
+                for row in rows
+                if isinstance(row, dict) and _looks_like_native_model(row)
+            ]
+        )
+        if models:
+            _log(
+                "warn",
+                "[codex-patch] API models unavailable; reusing "
+                f"{len(models)} row(s) from the same-CLI runtime catalog",
+            )
+        return models
+
+    @staticmethod
+    def _write_json_atomic(path: str, payload: Any) -> None:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary_path = path + f".tmp-{os.getpid()}"
+        try:
+            with open(temporary_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(
+                    payload,
+                    f,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                f.write("\n")
+            os.replace(temporary_path, path)
+        finally:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+
+    def _write_runtime_catalog_if_requested(self) -> None:
+        if not self.runtime_catalog_path:
+            return
+
+        models = self._runtime_catalog_models()
+        if not models:
+            _log(
+                "warn",
+                "[codex-patch] Runtime catalog generation skipped: no models available",
+            )
+            return
+
+        payload = {"models": models}
+        try:
+            self._write_json_atomic(self.runtime_catalog_path, payload)
+            catalog_sha256 = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if self.runtime_catalog_meta_path:
+                self._write_json_atomic(
+                    self.runtime_catalog_meta_path,
+                    {
+                        "generation": self.runtime_generation,
+                        "api_models_fetch_succeeded": (
+                            self.api_models_fetch_succeeded
+                        ),
+                        "api_model_ids": sorted(self.api_model_ids),
+                        "models": len(models),
+                        "catalog_sha256": catalog_sha256,
+                        "generated_at_unix": int(time.time()),
+                    },
+                )
+        except OSError as exc:
+            _log(
+                "warn",
+                "[codex-patch] Failed to write runtime catalog "
+                f"{self.runtime_catalog_path}: {exc}",
+            )
+            return
+
+        _log(
+            "info",
+            "[codex-patch] Runtime display catalog written: "
+            f"path={self.runtime_catalog_path}, models={len(models)}, "
+            f"api_fresh={self.api_models_fetch_succeeded}",
+        )
 
     @staticmethod
     def _extract_model_rows(payload: Any) -> list[Any]:
@@ -668,29 +1215,270 @@ class CodexCatalogPatcher:
         for item in models:
             if not isinstance(item, dict):
                 continue
-            slug = item.get("slug") or item.get("id")
+            model_id = item.get("id")
+            name = item.get("name")
+            route_slug = item.get("slug")
+            provider = item.get("provider")
+            is_mb_row = (
+                isinstance(name, str)
+                and bool(name)
+                and isinstance(route_slug, str)
+                and bool(route_slug)
+                and (
+                    isinstance(provider, str)
+                    or (
+                        route_slug != name
+                        and "/" in route_slug
+                    )
+                )
+            )
+            if is_mb_row:
+                model_id = name
+            elif not isinstance(model_id, str) or not model_id:
+                model_id = name if is_mb_row else route_slug or name
+            slug = model_id
             if not isinstance(slug, str) or not slug:
                 continue
             model = deepcopy(item)
-            model.setdefault("slug", slug)
-            if "id" in item:
-                model.setdefault("id", slug)
+            _synchronize_reasoning_summary_fields(model)
+            source_fields = {key for key in item if key not in MODEL_INTERNAL_KEYS}
+            if (
+                "supports_reasoning_summary_parameter" in model
+                or "supports_reasoning_summaries" in model
+            ):
+                source_fields.update(
+                    {
+                        "supports_reasoning_summary_parameter",
+                        "supports_reasoning_summaries",
+                    }
+                )
+            model["_source_fields"] = tuple(sorted(source_fields))
+            model["slug"] = slug
+            model["id"] = slug
+            model["display_name"] = _model_display_name(model, slug)
+            provider = model.get("provider") or model.get("owned_by")
+            if isinstance(provider, str) and provider:
+                model["provider"] = provider
             clean_models.append(model)
         return clean_models
 
     @staticmethod
-    def _dedupe_models(models: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    def _dedupe_models(
+        models: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         clean_models: list[dict[str, Any]] = []
         slugs: list[str] = []
         for model in models:
-            slug = model.get("slug") or model.get("id")
+            slug = _model_id(model)
             if not isinstance(slug, str) or not slug or slug in slugs:
                 continue
             normalized = deepcopy(model)
-            normalized.setdefault("slug", slug)
+            normalized["slug"] = slug
+            normalized["id"] = slug
             clean_models.append(normalized)
             slugs.append(slug)
         return clean_models, slugs
+
+    @staticmethod
+    def _model_aliases(model: dict[str, Any]) -> list[str]:
+        aliases: list[str] = []
+        for key in ("slug", "id", "name"):
+            value = model.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            for alias in (value, value.rsplit("/", 1)[-1]):
+                if alias and alias not in aliases:
+                    aliases.append(alias)
+        return aliases
+
+    def _select_metadata_template(
+        self,
+        model: dict[str, Any],
+        templates: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        if not templates:
+            return None, False
+
+        by_alias: dict[str, dict[str, Any]] = {}
+        for template in templates:
+            for alias in self._model_aliases(template):
+                by_alias.setdefault(alias, template)
+
+        source_aliases = self._model_aliases(model)
+        for alias in source_aliases:
+            template = by_alias.get(alias)
+            if template is not None:
+                return template, True
+
+        def family_match(aliases: list[str]) -> dict[str, Any] | None:
+            best: tuple[int, dict[str, Any]] | None = None
+            for alias in aliases:
+                source_parts = alias.lower().split("-")
+                for template in templates:
+                    template_slug = _model_id(template)
+                    if template_slug is None:
+                        continue
+                    template_parts = template_slug.lower().rsplit("/", 1)[-1].split("-")
+                    score = 0
+                    for source_part, template_part in zip(
+                        source_parts,
+                        template_parts,
+                    ):
+                        if source_part != template_part:
+                            break
+                        score += 1
+                    if score < 2:
+                        continue
+                    if best is None or score > best[0]:
+                        best = (score, template)
+            return best[1] if best is not None else None
+
+        template = family_match(source_aliases)
+        if template is not None:
+            return template, False
+
+        desired_aliases = [
+            self.desired_model,
+            self.desired_model.rsplit("/", 1)[-1],
+        ]
+        for alias in desired_aliases:
+            template = by_alias.get(alias)
+            if template is not None:
+                return template, False
+
+        template = family_match(desired_aliases)
+        if template is not None:
+            return template, False
+
+        for template in templates:
+            if (
+                template.get("visibility") == "list"
+                and template.get("supported_in_api") is not False
+            ):
+                return template, False
+        return templates[0], False
+
+    @staticmethod
+    def _replace_template_identity(
+        model: dict[str, Any],
+        template_slug: str,
+        replacement: str,
+    ) -> None:
+        if not template_slug or not replacement or template_slug == replacement:
+            return
+
+        base_instructions = model.get("base_instructions")
+        if isinstance(base_instructions, str):
+            model["base_instructions"] = base_instructions.replace(
+                template_slug,
+                replacement,
+            )
+
+        model_messages = model.get("model_messages")
+        if not isinstance(model_messages, dict):
+            return
+        instructions_template = model_messages.get("instructions_template")
+        if isinstance(instructions_template, str):
+            model_messages["instructions_template"] = instructions_template.replace(
+                template_slug,
+                replacement,
+            )
+
+    def _enrich_model_metadata(
+        self,
+        models: list[dict[str, Any]],
+        templates: list[dict[str, Any]],
+        *,
+        log_result: bool = True,
+    ) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        exact_matches = 0
+        template_fallbacks = 0
+        static_fallbacks = 0
+
+        for model in models:
+            slug = _model_id(model)
+            if slug is None:
+                continue
+            display_name = _model_display_name(model, slug)
+            template, exact_match = self._select_metadata_template(model, templates)
+
+            if template is None:
+                merged = _default_native_model(slug, display_name)
+                static_fallbacks += 1
+            else:
+                merged = deepcopy(template)
+                if exact_match:
+                    exact_matches += 1
+                else:
+                    template_fallbacks += 1
+
+            source_fields = _model_source_fields(model)
+            for key in source_fields:
+                if key in MODEL_INTERNAL_KEYS or key not in model:
+                    continue
+                merged[key] = deepcopy(model[key])
+
+            defaults = _default_native_model(slug, display_name)
+            for key, value in defaults.items():
+                merged.setdefault(key, deepcopy(value))
+            _synchronize_reasoning_summary_fields(merged)
+            if exact_match or "input_modalities" in source_fields:
+                merged["input_modalities"] = _input_modalities_or_default(merged)
+            else:
+                # A fallback template is not evidence that the remote model
+                # accepts images. Keep unknown models text-only by default.
+                merged["input_modalities"] = list(DEFAULT_INPUT_MODALITIES)
+
+            merged["slug"] = slug
+            merged["id"] = slug
+            if (
+                exact_match
+                and template is not None
+                and "display_name" not in source_fields
+            ):
+                merged["display_name"] = _model_display_name(template, display_name)
+            else:
+                merged["display_name"] = display_name
+
+            provider = model.get("provider") or model.get("owned_by")
+            if isinstance(provider, str) and provider:
+                merged["provider"] = provider
+
+            # API discovery decides which additional identities are displayed.
+            # Provider metadata and source-supplied visibility flags must not
+            # veto a model returned by the configured /models endpoint.
+            merged["visibility"] = "list"
+            merged["supported_in_api"] = True
+
+            if not exact_match and template is not None:
+                replacement = model.get("name")
+                if not isinstance(replacement, str) or not replacement:
+                    replacement = slug.rsplit("/", 1)[-1]
+                template_slug = _model_id(template) or ""
+                self._replace_template_identity(
+                    merged,
+                    template_slug.rsplit("/", 1)[-1],
+                    replacement,
+                )
+                if "description" not in source_fields:
+                    if isinstance(provider, str) and provider:
+                        merged["description"] = f"{display_name} via {provider}."
+                    else:
+                        merged["description"] = None
+
+            merged["_source_fields"] = tuple(sorted(source_fields))
+            enriched.append(merged)
+
+        if log_result and models:
+            _log(
+                "info",
+                "[codex-patch] Model metadata enriched at startup: "
+                f"rows={len(enriched)}, exact_catalog={exact_matches}, "
+                f"catalog_fallback={template_fallbacks}, "
+                f"static_fallback={static_fallbacks}",
+            )
+        return enriched
 
     def _patch_models_response(self, request, response) -> None:
         status = getattr(response, "status_code", "<unknown>")
@@ -713,7 +1501,8 @@ class CodexCatalogPatcher:
         elif isinstance(body, dict) and isinstance(body.get("models"), list):
             changed = self._patch_model_array(body["models"], mode="native")
         elif isinstance(body, list):
-            changed = self._patch_model_array(body, mode="native")
+            mode = self._infer_model_array_mode(body, request)
+            changed = self._patch_model_array(body, mode=mode)
 
         after_summary = self._models_body_summary(body)
         if not changed:
@@ -732,23 +1521,183 @@ class CodexCatalogPatcher:
             f"path={_request_path(request)} status={status} {after_summary}",
         )
 
-    def _patch_model_array(self, rows: list[Any], mode: str) -> bool:
-        existing = {_model_id(row) for row in rows}
-        existing.discard(None)
+    @staticmethod
+    def _infer_model_array_mode(rows: list[Any], request) -> str:
+        native_score = 0
+        openai_score = 0
 
-        added = 0
+        for row in rows:
+            if _looks_like_native_model(row):
+                native_score += 3
+                continue
+            if _looks_like_openai_model(row):
+                openai_score += 3
+                continue
+            if not isinstance(row, dict):
+                continue
+            if isinstance(row.get("slug"), str):
+                native_score += 1
+            elif isinstance(row.get("id"), str):
+                openai_score += 1
+
+        if native_score != openai_score:
+            return "native" if native_score > openai_score else "openai"
+
+        path = _request_path(request).rstrip("/").lower()
+        if path.endswith("/v1/models"):
+            return "openai"
+        return "native"
+
+    @staticmethod
+    def _native_response_template(
+        rows: list[Any], desired_model: str
+    ) -> dict[str, Any] | None:
+        native_rows = [row for row in rows if _looks_like_native_model(row)]
+        if not native_rows:
+            return None
+
+        desired_aliases = {
+            desired_model,
+            desired_model.rsplit("/", 1)[-1],
+        }
+        for row in native_rows:
+            slug = _model_id(row)
+            if slug in desired_aliases or (
+                isinstance(slug, str) and slug.rsplit("/", 1)[-1] in desired_aliases
+            ):
+                return row
+        for row in native_rows:
+            if row.get("visibility") == "list":
+                return row
+        return native_rows[0]
+
+    def _catalog_model_for_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        slug = _model_id(row)
+        if slug is None:
+            return None
+        catalog_model = self.catalog_by_slug.get(slug)
+        if catalog_model is not None:
+            return catalog_model
+
+        normalized = self._normalize_model_rows([row])
+        if not normalized:
+            return None
+        enriched = self._enrich_model_metadata(
+            normalized,
+            self.metadata_models,
+            log_result=False,
+        )
+        return enriched[0] if enriched else None
+
+    @staticmethod
+    def _native_model_from_catalog(
+        model: dict[str, Any],
+        template: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        slug = _model_id(model)
+        if slug is None:
+            return {}
+        display_name = _model_display_name(model, slug)
+
+        if template is not None:
+            row = deepcopy(template)
+        else:
+            row = _default_native_model(slug, display_name)
+
+        for key, value in model.items():
+            if key in MODEL_INTERNAL_KEYS or key in MODEL_SOURCE_ONLY_KEYS:
+                continue
+            row[key] = deepcopy(value)
+
+        defaults = _default_native_model(slug, display_name)
+        for key, value in defaults.items():
+            row.setdefault(key, deepcopy(value))
+        _synchronize_reasoning_summary_fields(row)
+        row["input_modalities"] = _input_modalities_or_default(model)
+
+        for key in MODEL_INTERNAL_KEYS | MODEL_SOURCE_ONLY_KEYS:
+            row.pop(key, None)
+
+        row["slug"] = slug
+        row["display_name"] = display_name
+        row["visibility"] = "list"
+        row["supported_in_api"] = True
+        return row
+
+    def _patch_model_array(self, rows: list[Any], mode: str) -> bool:
+        native_template = (
+            self._native_response_template(rows, self.desired_model)
+            if mode == "native"
+            else None
+        )
+
+        changed = False
+        existing: set[str] = set()
+        complete_ids = {
+            slug
+            for row in rows
+            if (
+                (mode == "native" and _looks_like_native_model(row))
+                or (mode == "openai" and _looks_like_openai_model(row))
+            )
+            for slug in [_model_id(row)]
+            if slug is not None
+        }
+        patched_rows: list[Any] = []
+        for row in rows:
+            is_complete = (
+                (mode == "native" and _looks_like_native_model(row))
+                or (mode == "openai" and _looks_like_openai_model(row))
+            )
+            converted: dict[str, Any] | None = None
+            if not is_complete:
+                source_model = self._catalog_model_for_row(row)
+                if source_model is not None:
+                    if mode == "native":
+                        converted = self._native_model_from_catalog(
+                            source_model,
+                            native_template,
+                        )
+                    else:
+                        converted = _openai_model_from_catalog(source_model)
+
+            final_row = converted or row
+            slug = _model_id(final_row)
+            if slug is None:
+                patched_rows.append(final_row)
+                continue
+            if (not is_complete and slug in complete_ids) or slug in existing:
+                changed = True
+                continue
+            if converted is not None:
+                changed = True
+            patched_rows.append(final_row)
+            existing.add(slug)
+
+        if len(patched_rows) != len(rows):
+            changed = True
+        rows[:] = patched_rows
+
         for model in self.catalog_models:
             slug = model["slug"]
             if slug in existing:
                 continue
-            rows.append(_openai_model_from_catalog(model) if mode == "openai" else deepcopy(model))
+            if mode == "openai":
+                row = _openai_model_from_catalog(model)
+            else:
+                row = self._native_model_from_catalog(model, native_template)
+            if not row:
+                continue
+            rows.append(row)
             existing.add(slug)
-            added += 1
+            changed = True
 
-        return added > 0
+        return changed
 
     def _patch_statsig_response(self, flow, response) -> None:
-        if not flow.metadata.get("codex_patch_statsig_initialize") and not _is_statsig_initialize(flow.request):
+        if not flow.metadata.get(
+            "codex_patch_statsig_initialize"
+        ) and not _is_statsig_initialize(flow.request):
             return
 
         status = getattr(response, "status_code", 0)
@@ -789,6 +1738,80 @@ class CodexCatalogPatcher:
             "error",
             f"[codex-patch] AB response patched: host={getattr(flow.request, 'pretty_host', flow.request.host)} "
             f"path={_request_path(flow.request)} {after}",
+        )
+
+    def _patch_wham_statsig_response(self, request, response) -> None:
+        status = getattr(response, "status_code", 0)
+        if not isinstance(status, int) or not 200 <= status < 300:
+            return
+
+        body = self._read_json_response(response)
+        if not isinstance(body, dict):
+            _log(
+                "warn",
+                "[codex-patch] WHAM Statsig bootstrap not patched: "
+                f"host={getattr(request, 'pretty_host', request.host)} "
+                f"path={_request_path(request)} reason=not_json_object",
+            )
+            return
+
+        raw_payload = body.get("statsigPayload")
+        if not isinstance(raw_payload, str):
+            _log(
+                "warn",
+                "[codex-patch] WHAM Statsig bootstrap not patched: "
+                f"host={getattr(request, 'pretty_host', request.host)} "
+                f"path={_request_path(request)} reason=missing_statsigPayload_string",
+            )
+            return
+
+        try:
+            payload = json.loads(raw_payload)
+        except (ValueError, TypeError) as exc:
+            _log(
+                "warn",
+                "[codex-patch] WHAM Statsig bootstrap not patched: "
+                f"host={getattr(request, 'pretty_host', request.host)} "
+                f"path={_request_path(request)} reason=invalid_statsigPayload "
+                f"error={exc}",
+            )
+            return
+
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("dynamic_configs"), dict
+        ):
+            _log(
+                "warn",
+                "[codex-patch] WHAM Statsig bootstrap not patched: "
+                f"host={getattr(request, 'pretty_host', request.host)} "
+                f"path={_request_path(request)} reason=unknown_payload_shape",
+            )
+            return
+
+        changed = self._patch_statsig_dynamic_configs(payload)
+        if not changed:
+            _log(
+                "warn",
+                "[codex-patch] WHAM Statsig bootstrap not patched: "
+                f"host={getattr(request, 'pretty_host', request.host)} "
+                f"path={_request_path(request)} reason=dynamic_config_patch_failed",
+            )
+            return
+
+        self._patch_statsig_layer_configs(payload)
+        payload["hash_used"] = "none"
+        body["statsigPayload"] = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        response.set_text(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+        _remove_stale_headers(response.headers)
+        _log(
+            "info",
+            "[codex-patch] WHAM Statsig bootstrap patched: "
+            f"host={getattr(request, 'pretty_host', request.host)} "
+            f"path={_request_path(request)} {self._statsig_body_summary(payload)}",
         )
 
     def _read_json_response(self, response) -> Any | None:
@@ -849,7 +1872,9 @@ class CodexCatalogPatcher:
             if target.get("available_count") is not None:
                 target_parts.append(f"available:{target['available_count']}")
             if target.get("use_hidden_models") is not None:
-                target_parts.append(f"hidden:{_compact_value(target['use_hidden_models'])}")
+                target_parts.append(
+                    f"hidden:{_compact_value(target['use_hidden_models'])}"
+                )
             parts.append(f"{key}=" + ",".join(target_parts))
         if missing:
             parts.append("missing=" + ",".join(missing))
@@ -882,7 +1907,10 @@ class CodexCatalogPatcher:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(body, f, ensure_ascii=False, separators=(",", ":"))
         except OSError as exc:
-            _log("error", f"[codex-patch] Failed to save Statsig snapshot to {path}: {exc}")
+            _log(
+                "error",
+                f"[codex-patch] Failed to save Statsig snapshot to {path}: {exc}",
+            )
 
     def _load_statsig_snapshot_or_template(self) -> dict[str, Any] | None:
         snapshot_path = _statsig_snapshot_path()
@@ -897,13 +1925,27 @@ class CodexCatalogPatcher:
                     if not isinstance(template_body, dict):
                         raise ValueError("init-template.json is not a JSON object")
                     with open(snapshot_path, "w", encoding="utf-8") as dst:
-                        json.dump(template_body, dst, ensure_ascii=False, separators=(",", ":"))
-                    _log("info", "[codex-patch] Statsig snapshot seeded from init-template.json")
+                        json.dump(
+                            template_body,
+                            dst,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    _log(
+                        "info",
+                        "[codex-patch] Statsig snapshot seeded from init-template.json",
+                    )
                 except (OSError, json.JSONDecodeError, ValueError) as exc:
-                    _log("error", f"[codex-patch] Failed to seed snapshot from template: {exc}")
+                    _log(
+                        "error",
+                        f"[codex-patch] Failed to seed snapshot from template: {exc}",
+                    )
                     return None
             else:
-                _log("error", f"[codex-patch] Statsig init-template not found: {template_path}")
+                _log(
+                    "error",
+                    f"[codex-patch] Statsig init-template not found: {template_path}",
+                )
                 return None
 
         try:
@@ -921,7 +1963,10 @@ class CodexCatalogPatcher:
                 body["hash_used"] = "none"
             return body
         except (OSError, json.JSONDecodeError, ValueError) as exc:
-            _log("error", f"[codex-patch] Failed to load Statsig snapshot {snapshot_path}: {exc}")
+            _log(
+                "error",
+                f"[codex-patch] Failed to load Statsig snapshot {snapshot_path}: {exc}",
+            )
             return None
 
     def _build_statsig_fallback_body(self) -> dict[str, Any]:
@@ -977,7 +2022,9 @@ class CodexCatalogPatcher:
             f"path={_request_path(request)} reason={reason} {self._statsig_body_summary(body)}",
         )
 
-    def _statsig_entry_summary(self, body: dict[str, Any], entry: Any) -> dict[str, Any]:
+    def _statsig_entry_summary(
+        self, body: dict[str, Any], entry: Any
+    ) -> dict[str, Any]:
         if not isinstance(entry, dict):
             return {"present": False}
 
@@ -986,7 +2033,11 @@ class CodexCatalogPatcher:
         if not isinstance(value, dict):
             ref = entry.get("v")
             values = body.get("values")
-            if isinstance(values, list) and isinstance(ref, int) and 0 <= ref < len(values):
+            if (
+                isinstance(values, list)
+                and isinstance(ref, int)
+                and 0 <= ref < len(values)
+            ):
                 value = values[ref]
                 shape = "compact"
 
@@ -1024,7 +2075,11 @@ class CodexCatalogPatcher:
         if not isinstance(value, dict):
             ref = entry.get("v")
             values = body.get("values")
-            if isinstance(values, list) and isinstance(ref, int) and 0 <= ref < len(values):
+            if (
+                isinstance(values, list)
+                and isinstance(ref, int)
+                and 0 <= ref < len(values)
+            ):
                 value = values[ref]
                 shape = "compact"
 
@@ -1044,7 +2099,9 @@ class CodexCatalogPatcher:
     def _patch_statsig_dynamic_configs(self, body: dict[str, Any]) -> bool:
         dynamic_configs = body.get("dynamic_configs")
         if not isinstance(dynamic_configs, dict):
-            _log("error", "[codex-patch] Statsig response has no dynamic_configs object")
+            _log(
+                "error", "[codex-patch] Statsig response has no dynamic_configs object"
+            )
             return False
 
         changed = False
@@ -1052,7 +2109,10 @@ class CodexCatalogPatcher:
             entry = dynamic_configs.get(key)
             if not isinstance(entry, dict):
                 dynamic_configs[key] = self._build_statsig_dynamic_config_entry(key)
-                _log("info", f"[codex-patch] Statsig dynamic config key {key} injected (missing in upstream)")
+                _log(
+                    "info",
+                    f"[codex-patch] Statsig dynamic config key {key} injected (missing in upstream)",
+                )
                 changed = True
             elif self._patch_statsig_entry(body, entry):
                 changed = True
@@ -1087,7 +2147,9 @@ class CodexCatalogPatcher:
 
         entry = layer_configs.get(STATSIG_I18N_LAYER_CONFIG_KEY)
         if not isinstance(entry, dict):
-            layer_configs[STATSIG_I18N_LAYER_CONFIG_KEY] = self._build_i18n_layer_entry({})
+            layer_configs[STATSIG_I18N_LAYER_CONFIG_KEY] = self._build_i18n_layer_entry(
+                {}
+            )
             return True
 
         return self._patch_i18n_layer_entry(body, entry)
@@ -1107,7 +2169,9 @@ class CodexCatalogPatcher:
                 return True
         return False
 
-    def _patch_i18n_layer_entry(self, body: dict[str, Any], entry: dict[str, Any]) -> bool:
+    def _patch_i18n_layer_entry(
+        self, body: dict[str, Any], entry: dict[str, Any]
+    ) -> bool:
         self._ensure_explicit_parameters(entry, ("enable_i18n", "locale_source"))
 
         value = entry.get("value")
@@ -1143,7 +2207,9 @@ class CodexCatalogPatcher:
         }
 
     @staticmethod
-    def _ensure_explicit_parameters(entry: dict[str, Any], names: tuple[str, ...]) -> None:
+    def _ensure_explicit_parameters(
+        entry: dict[str, Any], names: tuple[str, ...]
+    ) -> None:
         explicit = entry.get("explicit_parameters")
         if not isinstance(explicit, list):
             explicit = []
@@ -1165,11 +2231,14 @@ class CodexCatalogPatcher:
                 result.append(slug)
                 seen.add(slug)
 
-        if self.desired_model not in seen:
+        if self.desired_model in self.catalog_slugs and self.desired_model not in seen:
             result.append(self.desired_model)
 
         merged["available_models"] = result
-        merged["use_hidden_models"] = True
+        # Current desktop builds interpret true as "filter strictly through the
+        # remote available_models allowlist". False keeps every app-server row
+        # whose catalog metadata already marks it as visible.
+        merged["use_hidden_models"] = False
         merged["default_model"] = self.desired_model
         return merged
 
